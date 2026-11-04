@@ -6,6 +6,12 @@ const COMMON = Object.freeze({
   maxBodyBytes: 1_048_576, // 1 MiB
   requestTimeoutMs: 30_000,
   maxTextChars: 20_000,
+  // Phase 05-B2.2 rate limiting (per client IP, fixed window).
+  rateLimitMax: 60,
+  rateLimitWindowMs: 60_000,
+  // Number of trusted reverse proxies in front of the server. 0 = never
+  // trust X-Forwarded-For (use the TCP peer address).
+  trustedProxyHops: 0,
 });
 
 export const PROFILES = Object.freeze({
