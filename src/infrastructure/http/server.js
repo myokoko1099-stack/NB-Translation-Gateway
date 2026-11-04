@@ -2,12 +2,18 @@ import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { AppError } from '../../domain/errors.js';
 import { validateTranslateRequest } from '../../domain/translation.js';
+import { unauthorizedError } from './auth.js';
 
 const BASE_HEADERS = Object.freeze({
   'content-type': 'application/json; charset=utf-8',
   'cache-control': 'no-store',
   'x-content-type-options': 'nosniff',
 });
+
+/** Routes that require a valid Bearer token. /health stays public. */
+const PROTECTED_PATHS = new Set(['/v1/translate']);
+
+const AUTH_NOT_ENFORCED = Object.freeze({ enabled: false, authenticate: () => ({ ok: true }) });
 
 function sendJson(res, status, payload, extraHeaders) {
   const body = JSON.stringify(payload);
@@ -63,9 +69,10 @@ async function readJsonBody(req, maxBytes) {
  *     translate: ReturnType<typeof import('../../application/translateService.js').createTranslateService>,
  *   },
  *   logger: ReturnType<typeof import('../logging/logger.js').createLogger>,
+ *   authenticator?: ReturnType<typeof import('./auth.js').createAuthenticator>,
  * }} deps
  */
-export function createServer({ config, services, logger }) {
+export function createServer({ config, services, logger, authenticator = AUTH_NOT_ENFORCED }) {
   const routes = {
     '/health': {
       GET: async () => ({ status: 200, body: services.health.getHealth() }),
@@ -100,6 +107,16 @@ export function createServer({ config, services, logger }) {
         throw new AppError(405, 'METHOD_NOT_ALLOWED', 'Method not allowed.', undefined, {
           allow: Object.keys(route).join(', '),
         });
+      }
+      // Authenticate BEFORE the handler runs: no body parsing, validation or
+      // provider call ever happens for an unauthenticated request.
+      if (PROTECTED_PATHS.has(pathname)) {
+        const outcome = authenticator.authenticate(req);
+        if (!outcome.ok) {
+          // Reason category only; never the header or any token value.
+          logger.warn('authentication failed', { requestId, reason: outcome.reason });
+          throw unauthorizedError();
+        }
       }
       const result = await handler(req);
       status = result.status;
