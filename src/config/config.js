@@ -50,6 +50,16 @@ export function loadConfig(env) {
   const requestTimeoutMs = intVar(env, 'REQUEST_TIMEOUT_MS', profile.requestTimeoutMs, { min: 1000, max: 600_000 }, problems);
   const maxTextChars = intVar(env, 'MAX_TEXT_CHARS', profile.maxTextChars, { min: 1, max: 1_000_000 }, problems);
 
+  const rateLimitMax = intVar(env, 'GATEWAY_RATE_LIMIT_MAX', profile.rateLimitMax, { min: 1, max: 100_000 }, problems);
+  const rateLimitWindowMs = intVar(
+    env,
+    'GATEWAY_RATE_LIMIT_WINDOW_MS',
+    profile.rateLimitWindowMs,
+    { min: 1000, max: 3_600_000 },
+    problems,
+  );
+  const trustedProxyHops = intVar(env, 'GATEWAY_TRUSTED_PROXY_HOPS', profile.trustedProxyHops, { min: 0, max: 10 }, problems);
+
   const host = env.HOST === undefined || env.HOST === '' ? profile.host : env.HOST;
   if (!/^[A-Za-z0-9.:_-]+$/.test(host)) {
     problems.push('HOST contains invalid characters');
@@ -71,5 +81,6 @@ export function loadConfig(env) {
     logLevel,
     server: Object.freeze({ host, port, requestTimeoutMs, maxBodyBytes }),
     limits: Object.freeze({ maxTextChars }),
+    rateLimit: Object.freeze({ max: rateLimitMax, windowMs: rateLimitWindowMs, trustedProxyHops }),
   });
 }

@@ -44,6 +44,9 @@ server.listen(config.server.port, config.server.host, () => {
     host: config.server.host,
     port: typeof addr === 'object' && addr ? addr.port : config.server.port,
     authEnabled: auth.enabled,
+    rateLimitMax: config.rateLimit.max,
+    rateLimitWindowMs: config.rateLimit.windowMs,
+    trustedProxyHops: config.rateLimit.trustedProxyHops,
   });
 });
 

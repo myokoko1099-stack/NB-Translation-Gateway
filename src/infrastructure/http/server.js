@@ -3,6 +3,7 @@ import http from 'node:http';
 import { AppError } from '../../domain/errors.js';
 import { validateTranslateRequest } from '../../domain/translation.js';
 import { unauthorizedError } from './auth.js';
+import { resolveClientIp } from './clientIp.js';
 
 const BASE_HEADERS = Object.freeze({
   'content-type': 'application/json; charset=utf-8',
@@ -70,9 +71,10 @@ async function readJsonBody(req, maxBytes) {
  *   },
  *   logger: ReturnType<typeof import('../logging/logger.js').createLogger>,
  *   authenticator?: ReturnType<typeof import('./auth.js').createAuthenticator>,
+ *   rateLimiter?: ReturnType<typeof import('./rateLimiter.js').createRateLimiter> | null,
  * }} deps
  */
-export function createServer({ config, services, logger, authenticator = AUTH_NOT_ENFORCED }) {
+export function createServer({ config, services, logger, authenticator = AUTH_NOT_ENFORCED, rateLimiter = null }) {
   const routes = {
     '/health': {
       GET: async () => ({ status: 200, body: services.health.getHealth() }),
@@ -95,6 +97,7 @@ export function createServer({ config, services, logger, authenticator = AUTH_NO
     const startedAt = process.hrtime.bigint();
     let pathname = '/';
     let status = 500;
+    let rateHeaders = {};
 
     try {
       pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
@@ -118,9 +121,30 @@ export function createServer({ config, services, logger, authenticator = AUTH_NO
           throw unauthorizedError();
         }
       }
+      // Rate limiting runs AFTER authentication on purpose: only requests that
+      // carry a valid token create/consume limiter records, so unauthenticated
+      // traffic cannot fill the limiter's memory. Failures here also stop the
+      // request before the handler, so the translation provider is never called.
+      if (rateLimiter && PROTECTED_PATHS.has(pathname)) {
+        const decision = rateLimiter.check(resolveClientIp(req, config.rateLimit.trustedProxyHops));
+        rateHeaders = {
+          'ratelimit-limit': String(decision.limit),
+          'ratelimit-remaining': String(decision.remaining),
+          'ratelimit-reset': String(decision.resetSeconds),
+        };
+        if (!decision.allowed) {
+          // No client address or token is logged.
+          logger.warn('rate limit exceeded', { requestId });
+          throw new AppError(429, 'RATE_LIMITED', 'Too many requests.', undefined, {
+            ...rateHeaders,
+            'retry-after': String(decision.retryAfterSeconds),
+            connection: 'close',
+          });
+        }
+      }
       const result = await handler(req);
       status = result.status;
-      sendJson(res, status, result.body, { 'x-request-id': requestId });
+      sendJson(res, status, result.body, { ...rateHeaders, 'x-request-id': requestId });
     } catch (err) {
       let appError;
       if (err instanceof AppError) {
@@ -133,7 +157,7 @@ export function createServer({ config, services, logger, authenticator = AUTH_NO
       status = appError.status;
       const error = { code: appError.code, message: appError.message, requestId };
       if (appError.details) error.details = appError.details;
-      sendJson(res, status, { error }, { ...appError.headers, 'x-request-id': requestId });
+      sendJson(res, status, { error }, { ...rateHeaders, ...appError.headers, 'x-request-id': requestId });
     } finally {
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
       logger.info('request', { requestId, method: req.method, path: pathname, status, durationMs: Math.round(durationMs) });
