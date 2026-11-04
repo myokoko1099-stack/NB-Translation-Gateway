@@ -1,0 +1,18 @@
+{
+  "name": "mnb-translation-gateway",
+  "version": "0.1.0",
+  "description": "MNB translation gateway - Phase 05-B1 backend foundation (no provider connected)",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
