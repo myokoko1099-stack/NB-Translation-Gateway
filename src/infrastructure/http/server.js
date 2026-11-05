@@ -4,7 +4,9 @@ import { AppError } from '../../domain/errors.js';
 import { validateTranslateRequest } from '../../domain/translation.js';
 import { unauthorizedError } from './auth.js';
 import { resolveClientIp } from './clientIp.js';
+import { describeError } from '../logging/redact.js';
 import { createCorsPolicy } from './cors.js';
+import { toClientError } from './errorResponse.js';
 import { readJsonBody } from './httpProtection.js';
 import { SECURITY_HEADERS } from './securityHeaders.js';
 
@@ -177,20 +179,24 @@ export function createServer({ config, services, logger, authenticator = AUTH_NO
       status = result.status;
       sendJson(res, status, result.body, { ...corsHeaders, ...rateHeaders, 'x-request-id': requestId });
     } catch (err) {
-      let appError;
-      if (err instanceof AppError) {
-        appError = err;
-      } else {
-        // Log name/message only; never the request or any secret.
-        logger.error('unhandled error', { requestId, errorName: err?.name, errorMessage: err?.message });
-        appError = new AppError(500, 'INTERNAL_ERROR', 'Internal server error.');
+      // Phase 05-B3: every error leaves through toClientError() (errorResponse.js).
+      // Non-AppError -> generic 500; AppError >= 500 keeps only status + code
+      // (fixed message, no details / headers), so a provider can never leak
+      // upstream text; AppError < 500 stays client-safe and is redacted.
+      const clientError = toClientError(err);
+      if (!(err instanceof AppError)) {
+        // Bounded, redacted name/message only; never the stack, request or any secret.
+        logger.error('unhandled error', { requestId, ...describeError(err) });
+      } else if (clientError.status >= 500) {
+        // Status and stable code only: the AppError message is never logged here.
+        logger.error('server error', { requestId, status: clientError.status, code: clientError.code });
       }
-      status = appError.status;
-      const error = { code: appError.code, message: appError.message, requestId };
-      if (appError.details) error.details = appError.details;
+      status = clientError.status;
+      const error = { code: clientError.code, message: clientError.message, requestId };
+      if (clientError.details) error.details = clientError.details;
       // CORS headers are included on errors too, so an allowed browser origin
       // can read 401 / 413 / 415 / 429 responses instead of an opaque failure.
-      sendJson(res, status, { error }, { ...corsHeaders, ...rateHeaders, ...appError.headers, 'x-request-id': requestId });
+      sendJson(res, status, { error }, { ...corsHeaders, ...rateHeaders, ...clientError.headers, 'x-request-id': requestId });
     } finally {
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
       logger.info('request', { requestId, method: req.method, path: pathname, status, durationMs: Math.round(durationMs) });
