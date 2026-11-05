@@ -1,0 +1,781 @@
+diff --git a/src/infrastructure/http/server.js b/src/infrastructure/http/server.js
+--- a/src/infrastructure/http/server.js
++++ b/src/infrastructure/http/server.js
+@@ -8,6 +8,8 @@
+ import { readJsonBody } from './httpProtection.js';
+ import { SECURITY_HEADERS } from './securityHeaders.js';
++import { toClientError } from './errorResponse.js';
++import { describeError } from '../logging/redact.js';
+@@ -163,16 +165,16 @@
+     } catch (err) {
+-      let appError;
+-      if (err instanceof AppError) {
+-        appError = err;
+-      } else {
+-        // Log name/message only; never the request or any secret.
+-        logger.error('unhandled error', { requestId, errorName: err?.name, errorMessage: err?.message });
+-        appError = new AppError(500, 'INTERNAL_ERROR', 'Internal server error.');
+-      }
+-      status = appError.status;
+-      const error = { code: appError.code, message: appError.message, requestId };
+-      if (appError.details) error.details = appError.details;
++      if (!(err instanceof AppError)) {
++        logger.error('unhandled error', { requestId, ...describeError(err) });
++      } else if (err.status >= 500) {
++        logger.error('application server error', { requestId, code: err.code });
++      }
++      const clientError = toClientError(err);
++      status = clientError.status;
++      const error = { code: clientError.code, message: clientError.message, requestId };
++      if (clientError.details) error.details = clientError.details;
+@@ -183,7 +185,7 @@
+-      sendJson(res, status, { error }, { ...corsHeaders, ...rateHeaders, ...appError.headers, 'x-request-id': requestId });
++      sendJson(res, status, { error }, { ...corsHeaders, ...rateHeaders, ...clientError.headers, 'x-request-id': requestId });
+
+diff --git a/src/index.js b/src/index.js
+--- a/src/index.js
++++ b/src/index.js
+@@ -4,6 +4,7 @@
+ import { ConfigError } from './domain/errors.js';
+ import { buildApp } from './infrastructure/http/compose.js';
+ import { createLogger } from './infrastructure/logging/logger.js';
++import { assertProductionConfig } from './config/productionGuard.js';
+@@ -12,6 +13,7 @@
+   config = loadConfig(process.env);
+   // Production without GATEWAY_CLIENT_TOKEN throws here -> exit 1 below.
+   auth = loadAuthConfig(config, new EnvSecretProvider(process.env));
++  assertProductionConfig(config, auth);
+@@ -23,7 +25,7 @@
+-const logger = createLogger(config.logLevel);
++const logger = createLogger(config.logLevel, undefined, { secrets: auth.token ? [auth.token] : [] });
+
+diff --git a/src/infrastructure/logging/redact.js b/src/infrastructure/logging/redact.js
+new file mode 100644
+--- /dev/null
++++ b/src/infrastructure/logging/redact.js
+@@ -0,0 +1,212 @@
++import { Secret } from '../../config/secrets.js';
++
++/**
++ * Phase 05-B2.4: secret / sensitive-data redaction for logs and error text.
++ *
++ * Pure functions, no dependencies. Used by the logger (every line) and by
++ * the HTTP error layer. Two complementary strategies:
++ *
++ *   1. By NAME  - object keys such as `authorization`, `cookie`, `x-api-key`,
++ *                 anything ending in token / secret / password / apikey.
++ *   2. By SHAPE - Bearer tokens, `Authorization:` header text, `?key=` URL
++ *                 parameters, key=value / "key":"value" pairs, well-known
++ *                 credential formats, JWTs and PEM private keys.
++ *
++ * The logger can additionally scrub the EXACT values of known secrets
++ * (see createRedactor({ secrets })), which also covers a token that has no
++ * recognisable shape.
++ */
++
++export const REDACTED = '[REDACTED]';
++
++const MAX_DEPTH = 6;
++const MAX_ARRAY_ITEMS = 100;
++const MAX_ERROR_NAME = 100;
++const MAX_ERROR_MESSAGE = 500;
++const MIN_EXACT_SECRET_LENGTH = 6;
++
++/** Normalised (lower-case, letters+digits only) key names that are always sensitive. */
++const SENSITIVE_KEYS = new Set([
++  'authorization',
++  'proxyauthorization',
++  'cookie',
++  'setcookie',
++  'apikey',
++  'xapikey',
++  'xgoogapikey',
++  'bearer',
++]);
++const SENSITIVE_KEY_SUFFIX = /(apikey|secret|password|passwd|token|credential|credentials|privatekey)$/;
++
++/** @param {string} key */
++export function isSensitiveKey(key) {
++  const normalised = String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
++  return SENSITIVE_KEYS.has(normalised) || SENSITIVE_KEY_SUFFIX.test(normalised);
++}
++
++const KEY_NAMES = 'api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|secret|password|passwd|token';
++
++/** Order matters: header text first, then Bearer, then structured pairs, then raw formats. */
++const PATTERNS = [
++  // PEM private key blocks (also when truncated before the END line).
++  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, REDACTED],
++  // `Authorization: <anything>` / `Cookie: ...` / `x-goog-api-key: ...` (also quoted / JSON form).
++  [
++    /\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-goog-api-key)(["']?\s*[:=]\s*["']?)[^"'\r\n]+/gi,
++    `$1$2${REDACTED}`,
++  ],
++  // `Bearer <token>` anywhere in a string.
++  [/\bBearer\s+[^\s"',;]+/gi, `Bearer ${REDACTED}`],
++  // `Basic <base64>` (long values only, so ordinary prose is left alone).
++  [/\bBasic\s+[A-Za-z0-9+/]{16,}={0,2}/g, `Basic ${REDACTED}`],
++  // URL / form parameters: ?key=..., &api_key=..., &access_token=...
++  [
++    new RegExp(`(^|[?&;\\s"'])((?:key|auth|signature|sig|${KEY_NAMES})=)[^&\\s"'#]+`, 'gi'),
++    `$1$2${REDACTED}`,
++  ],
++  // key=value / "key": "value" pairs.
++  [new RegExp(`(["']?(?:${KEY_NAMES})["']?\\s*[:=]\\s*)(["']?)[^"'\\s,;}&]+`, 'gi'), `$1$2${REDACTED}`],
++  // Well-known credential formats.
++  [/AIza[0-9A-Za-z_-]{20,}/g, REDACTED],
++  [/\bsk-[A-Za-z0-9_-]{20,}/g, REDACTED],
++  [/\bgh[pousr]_[A-Za-z0-9]{20,}/g, REDACTED],
++  [/\bAKIA[0-9A-Z]{16}\b/g, REDACTED],
++  // JSON Web Tokens.
++  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, REDACTED],
++];
++
++/** @param {string} text */
++function redactByShape(text) {
++  let out = text;
++  for (const [pattern, replacement] of PATTERNS) {
++    out = out.replace(pattern, replacement);
++  }
++  return out;
++}
++
++/**
++ * Exact-value scrubbing for known secrets. Values shorter than
++ * MIN_EXACT_SECRET_LENGTH are skipped (they would mangle ordinary text);
++ * shape-based redaction still applies to them.
++ *
++ * @param {Array<Secret | string | null | undefined>} secrets
++ * @returns {string[]}
++ */
++function exactValues(secrets) {
++  const values = new Set();
++  for (const item of secrets) {
++    let raw;
++    if (item instanceof Secret) raw = item.reveal();
++    else if (typeof item === 'string') raw = item;
++    if (typeof raw !== 'string' || raw.length < MIN_EXACT_SECRET_LENGTH) continue;
++    values.add(raw);
++    const encoded = encodeURIComponent(raw);
++    if (encoded !== raw) values.add(encoded);
++  }
++  // Longest first so a value that contains another is replaced as a whole.
++  return [...values].sort((a, b) => b.length - a.length);
++}
++
++/**
++ * Build a redactor. `secrets` (optional) are Secret wrappers or strings whose
++ * exact values must never appear in output.
++ *
++ * @param {{ secrets?: Array<Secret | string | null | undefined> }} [options]
++ */
++export function createRedactor({ secrets = [] } = {}) {
++  const known = exactValues(secrets);
++
++  /** @param {string} text */
++  function string(text) {
++    let out = String(text);
++    for (const value of known) {
++      if (out.includes(value)) out = out.split(value).join(REDACTED);
++    }
++    return redactByShape(out);
++  }
++
++  /**
++   * Deep-copy `input` into a JSON-safe structure with sensitive keys and
++   * secret-looking strings redacted. Errors become { name, message } only
++   * (never the stack). Secret wrappers become '[REDACTED]'.
++   */
++  function value(input, depth = 0, seen = new WeakSet()) {
++    if (input instanceof Secret) return REDACTED;
++    switch (typeof input) {
++      case 'string':
++        return string(input);
++      case 'number':
++      case 'boolean':
++      case 'undefined':
++        return input;
++      case 'bigint':
++        return input.toString();
++      case 'function':
++      case 'symbol':
++        return undefined;
++      default:
++        break;
++    }
++    if (input === null) return null;
++    if (depth >= MAX_DEPTH) return '[Truncated]';
++    if (seen.has(input)) return '[Circular]';
++    seen.add(input);
++    try {
++      if (input instanceof Error) {
++        return { name: string(input.name), message: string(input.message) };
++      }
++      if (Array.isArray(input)) {
++        return input.slice(0, MAX_ARRAY_ITEMS).map((item) => value(item, depth + 1, seen));
++      }
++      if (typeof input.toJSON === 'function') {
++        return value(input.toJSON(), depth + 1, seen);
++      }
++      const out = {};
++      for (const [key, item] of Object.entries(input)) {
++        out[key] = isSensitiveKey(key) ? REDACTED : value(item, depth + 1, seen);
++      }
++      return out;
++    } finally {
++      seen.delete(input);
++    }
++  }
++
++  return { string, value };
++}
++
++const defaultRedactor = createRedactor();
++
++/**
++ * Redact secret-looking content in a string (shape-based only).
++ * @param {string} text
++ */
++export function redactString(text) {
++  return defaultRedactor.string(text);
++}
++
++/**
++ * Redact a value for logging (shape- and name-based only).
++ * @param {unknown} input
++ */
++export function redactValue(input) {
++  return defaultRedactor.value(input);
++}
++
++/**
++ * Safe, bounded description of anything that was thrown, for log fields.
++ * Name and message only - never the stack, never the cause, never other
++ * properties (provider errors often carry request headers or URLs).
++ *
++ * @param {unknown} err
++ * @returns {{ errorName: string, errorMessage: string }}
++ */
++export function describeError(err) {
++  const name = typeof err?.name === 'string' && err.name !== '' ? err.name : typeof err;
++  let message = '';
++  if (err instanceof Error) message = err.message;
++  else if (typeof err === 'string') message = err;
++  return {
++    errorName: redactString(name).slice(0, MAX_ERROR_NAME),
++    errorMessage: redactString(String(message)).slice(0, MAX_ERROR_MESSAGE),
++  };
++}
+
+diff --git a/src/infrastructure/logging/logger.js b/src/infrastructure/logging/logger.js
+new file mode 100644
+--- /dev/null
++++ b/src/infrastructure/logging/logger.js
+@@ -0,0 +1,40 @@
++import { createRedactor } from './redact.js';
++
++const ORDER = { silent: 0, error: 1, warn: 2, info: 3, debug: 4 };
++
++/**
++ * Minimal JSON-lines logger. Callers should only pass non-sensitive fields:
++ * never request bodies (novel text), headers or secrets.
++ *
++ * Phase 05-B2.4: as a safety net, every message and field is passed through
++ * the redactor before it is written, so an API key, Bearer token,
++ * Authorization/Cookie header or known secret value that slips into a log call
++ * is replaced by [REDACTED]. Secret wrappers always serialise as [REDACTED].
++ *
++ * @param {keyof typeof ORDER} level
++ * @param {(line: string) => void} [write]
++ * @param {{ secrets?: Array<import('../../config/secrets.js').Secret | string | null | undefined> }} [options]
++ *        `secrets`: exact values that must never appear in any log line.
++ */
++export function createLogger(level, write = (line) => process.stdout.write(`${line}\n`), options = {}) {
++  const threshold = ORDER[level] ?? ORDER.info;
++  const redactor = createRedactor({ secrets: options?.secrets ?? [] });
++  const emit = (name, message, fields) => {
++    if (ORDER[name] > threshold) return;
++    const safeFields = fields === undefined || fields === null ? undefined : redactor.value(fields);
++    write(
++      JSON.stringify({
++        time: new Date().toISOString(),
++        level: name,
++        message: typeof message === 'string' ? redactor.string(message) : message,
++        ...(typeof safeFields === 'object' ? safeFields : undefined),
++      }),
++    );
++  };
++  return {
++    error: (m, f) => emit('error', m, f),
++    warn: (m, f) => emit('warn', m, f),
++    info: (m, f) => emit('info', m, f),
++    debug: (m, f) => emit('debug', m, f),
++  };
++}
+
+diff --git a/src/infrastructure/http/errorResponse.js b/src/infrastructure/http/errorResponse.js
+new file mode 100644
+--- /dev/null
++++ b/src/infrastructure/http/errorResponse.js
+@@ -0,0 +1,82 @@
++import { AppError } from '../../domain/errors.js';
++import { redactString } from '../logging/redact.js';
++
++/**
++ * Phase 05-B2.4: error sanitisation for HTTP responses.
++ *
++ * Rules:
++ *  - Anything that is not an AppError (TypeError, provider SDK errors, thrown
++ *    strings/objects, ...) becomes a generic 500. Its message, stack, name and
++ *    properties are never sent to the client.
++ *  - An AppError with status >= 500 keeps only its status and (well-formed)
++ *    code; the message is replaced by a fixed generic text, and details and
++ *    extra headers are dropped. A future provider adapter therefore cannot leak
++ *    upstream error text by wrapping it in an AppError.
++ *  - An AppError with status < 500 is a deliberate, client-safe error
++ *    (validation, auth, rate limit, ...). Its text still passes through the
++ *    redactor as defence in depth; its headers (WWW-Authenticate, Retry-After,
++ *    Allow, Connection, ...) are kept.
++ */
++
++export const INTERNAL_ERROR_MESSAGE = 'Internal server error.';
++
++const GENERIC_SERVER_MESSAGES = Object.freeze({
++  500: INTERNAL_ERROR_MESSAGE,
++  501: 'Not implemented.',
++  502: 'Upstream service error.',
++  503: 'Service unavailable.',
++  504: 'Upstream service timed out.',
++});
++
++const CODE_FORMAT = /^[A-Z][A-Z0-9_]{0,63}$/;
++
++/**
++ * @typedef {object} ClientError
++ * @property {number} status
++ * @property {string} code
++ * @property {string} message
++ * @property {Array<Record<string, unknown>>} [details]
++ * @property {Record<string, string>} [headers]
++ */
++
++/** @returns {ClientError} */
++function internal() {
++  return { status: 500, code: 'INTERNAL_ERROR', message: INTERNAL_ERROR_MESSAGE };
++}
++
++/**
++ * Convert any thrown value into what may be sent to the client.
++ *
++ * @param {unknown} err
++ * @returns {ClientError}
++ */
++export function toClientError(err) {
++  if (!(err instanceof AppError)) return internal();
++
++  const status = Number.isInteger(err.status) && err.status >= 400 && err.status <= 599 ? err.status : 500;
++
++  if (status >= 500) {
++    return {
++      status,
++      code: typeof err.code === 'string' && CODE_FORMAT.test(err.code) ? err.code : 'INTERNAL_ERROR',
++      message: GENERIC_SERVER_MESSAGES[status] ?? INTERNAL_ERROR_MESSAGE,
++    };
++  }
++
++  const safe = {
++    status,
++    code: typeof err.code === 'string' && CODE_FORMAT.test(err.code) ? err.code : 'ERROR',
++    message: redactString(typeof err.message === 'string' ? err.message : ''),
++  };
++  if (Array.isArray(err.details)) {
++    safe.details = err.details.map((detail) => {
++      const out = {};
++      for (const [key, value] of Object.entries(detail ?? {})) {
++        out[key] = typeof value === 'string' ? redactString(value) : value;
++      }
++      return out;
++    });
++  }
++  if (err.headers) safe.headers = err.headers;
++  return safe;
++}
+
+diff --git a/src/config/productionGuard.js b/src/config/productionGuard.js
+new file mode 100644
+--- /dev/null
++++ b/src/config/productionGuard.js
+@@ -0,0 +1,73 @@
++import { ConfigError } from '../domain/errors.js';
++import { CLIENT_TOKEN_VAR } from './auth.js';
++
++/**
++ * Phase 05-B2.4: production configuration hardening.
++ *
++ * Runs at startup (src/index.js) AFTER loadConfig() and loadAuthConfig().
++ * Only NODE_ENV=production is checked; development and test are untouched.
++ * It introduces no new environment variable. Problems name the variable and
++ * the reason only - never a value.
++ */
++
++/** Obvious placeholder values that must never be used as the client token. */
++const PLACEHOLDER_TOKENS = new Set([
++  'changeme',
++  'change-me',
++  'change_me',
++  'replace-me',
++  'replaceme',
++  'your-token',
++  'your_token',
++  'yourtoken',
++  'your-token-here',
++  'token',
++  'secret',
++  'password',
++  'example',
++  'placeholder',
++  'test',
++  'todo',
++  'xxx',
++  'xxxx',
++]);
++
++/** `<set-in-hosting-dashboard>` or `${GATEWAY_CLIENT_TOKEN}` copied from docs / templates. */
++function looksLikePlaceholder(value) {
++  return /^<.*>$/.test(value) || /^\$\{.*\}$/.test(value) || PLACEHOLDER_TOKENS.has(value.toLowerCase());
++}
++
++/**
++ * @param {{ env: string, logLevel: string }} config
++ * @param {import('./auth.js').AuthConfig} auth
++ * @returns {string[]} one entry per problem (empty when the configuration is acceptable)
++ */
++export function collectProductionProblems(config, auth) {
++  if (config.env !== 'production') return [];
++
++  const problems = [];
++
++  if (!auth || !auth.enabled || !auth.token) {
++    problems.push(`${CLIENT_TOKEN_VAR} is required`);
++  } else if (looksLikePlaceholder(auth.token.reveal())) {
++    problems.push(`${CLIENT_TOKEN_VAR} must not be a placeholder value`);
++  }
++
++  if (config.logLevel === 'debug') {
++    problems.push('LOG_LEVEL must not be "debug" in production');
++  }
++
++  return problems;
++}
++
++/**
++ * @param {{ env: string, logLevel: string }} config
++ * @param {import('./auth.js').AuthConfig} auth
++ * @throws {ConfigError} listing every problem found (production only)
++ */
++export function assertProductionConfig(config, auth) {
++  const problems = collectProductionProblems(config, auth);
++  if (problems.length > 0) {
++    throw new ConfigError(problems);
++  }
++}
+
+diff --git a/test/redact.test.js b/test/redact.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/redact.test.js
+@@ -0,0 +1,32 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import { Secret } from '../src/config/secrets.js';
++import { createRedactor, describeError, redactString } from '../src/infrastructure/logging/redact.js';
++
++describe('B2.4 secret redaction', () => {
++  it('redacts sensitive object keys recursively', () => {
++    const redactor = createRedactor();
++    assert.deepEqual(redactor.value({ authorization: 'Bearer abcdefghi', nested: { apiKey: 'fake' }, safe: 'ok' }), {
++      authorization: '[REDACTED]', nested: { apiKey: '[REDACTED]' }, safe: 'ok',
++    });
++  });
++  it('redacts Bearer tokens and key query parameters in strings', () => {
++    const sample = `Authorization: Bearer ${'token-value-123'} https://x.invalid/?key=${'api-secret-123'}`;
++    const safe = redactString(sample);
++    assert.ok(!safe.includes('token-value-123'));
++    assert.ok(!safe.includes('api-secret-123'));
++    assert.match(safe, /\[REDACTED\]/);
++  });
++  it('scrubs exact configured Secret values even when they have no known shape', () => {
++    const secret = new Secret('private-random-value-987');
++    const safe = createRedactor({ secrets: [secret] }).string(`provider said ${secret.reveal()}`);
++    assert.equal(safe, 'provider said [REDACTED]');
++  });
++  it('does not include stack or cause when describing an Error', () => {
++    const error = new Error('upstream failed');
++    error.cause = new Error('nested cause');
++    const described = describeError(error);
++    assert.deepEqual(Object.keys(described).sort(), ['errorMessage', 'errorName']);
++    assert.equal(described.errorMessage, 'upstream failed');
++  });
++});
+
+diff --git a/test/loggerRedaction.test.js b/test/loggerRedaction.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/loggerRedaction.test.js
+@@ -0,0 +1,31 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import { Secret } from '../src/config/secrets.js';
++import { createLogger } from '../src/infrastructure/logging/logger.js';
++
++describe('B2.4 logger redaction', () => {
++  it('redacts known secret values, authorization fields and sensitive message text', () => {
++    const lines = [];
++    const secret = new Secret('custom-secret-value-12345');
++    const logger = createLogger('debug', (line) => lines.push(line), { secrets: [secret] });
++    logger.error(`provider failed with ${secret.reveal()}`, {
++      authorization: `Bearer ${'bearer-secret-12345'}`,
++      apiKey: 'another-secret-value',
++      note: 'safe context',
++    });
++    const output = lines.join('\n');
++    for (const value of ['custom-secret-value-12345', 'bearer-secret-12345', 'another-secret-value']) {
++      assert.ok(!output.includes(value), `log leaked ${value}`);
++    }
++    assert.ok(output.includes('[REDACTED]'));
++    assert.ok(output.includes('safe context'));
++  });
++  it('never serializes Error stack or cause properties', () => {
++    const lines = [];
++    const logger = createLogger('error', (line) => lines.push(line));
++    const error = new Error('safe-ish message');
++    error.stack = 'STACK-PRIVATE-MARKER';
++    logger.error('failure', { error });
++    assert.ok(!lines.join('').includes('STACK-PRIVATE-MARKER'));
++  });
++});
+
+diff --git a/test/errorResponse.test.js b/test/errorResponse.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/errorResponse.test.js
+@@ -0,0 +1,28 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import { AppError } from '../src/domain/errors.js';
++import { toClientError } from '../src/infrastructure/http/errorResponse.js';
++
++describe('B2.4 client error sanitisation', () => {
++  it('converts unknown errors to a generic 500 without internal details', () => {
++    const result = toClientError(new Error('private path /srv/app and secret token-xyz'));
++    assert.deepEqual(result, { status: 500, code: 'INTERNAL_ERROR', message: 'Internal server error.' });
++  });
++  it('hides message, details and headers for 5xx AppError', () => {
++    const result = toClientError(new AppError(502, 'UPSTREAM_FAILURE', 'api_key=hidden-value', [{ issue: 'secret' }], { 'x-internal': 'hidden' }));
++    assert.deepEqual(result, { status: 502, code: 'UPSTREAM_FAILURE', message: 'Upstream service error.' });
++  });
++  it('preserves safe 4xx contract and redacts credential-like text', () => {
++    const result = toClientError(new AppError(401, 'UNAUTHORIZED', 'Bearer private-token-123', undefined, { 'www-authenticate': 'Bearer' }));
++    assert.equal(result.status, 401);
++    assert.equal(result.code, 'UNAUTHORIZED');
++    assert.ok(!result.message.includes('private-token-123'));
++    assert.equal(result.headers['www-authenticate'], 'Bearer');
++  });
++  it('rejects malformed status and code values safely', () => {
++    const error = new AppError(200, 'bad code', 'message');
++    const result = toClientError(error);
++    assert.equal(result.status, 500);
++    assert.equal(result.code, 'INTERNAL_ERROR');
++  });
++});
+
+diff --git a/test/productionGuard.test.js b/test/productionGuard.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/productionGuard.test.js
+@@ -0,0 +1,27 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import { Secret } from '../src/config/secrets.js';
++import { assertProductionConfig, collectProductionProblems } from '../src/config/productionGuard.js';
++
++describe('B2.4 production configuration guard', () => {
++  const prod = { env: 'production', logLevel: 'info' };
++  const auth = (value) => ({ enabled: true, token: new Secret(value) });
++  it('allows production with a configured non-placeholder token and info logging', () => {
++    assert.deepEqual(collectProductionProblems(prod, auth('some-real-looking-token-123456')), []);
++    assert.doesNotThrow(() => assertProductionConfig(prod, auth('some-real-looking-token-123456')));
++  });
++  it('rejects missing authentication', () => {
++    assert.throws(() => assertProductionConfig(prod, { enabled: false, token: null }), /GATEWAY_CLIENT_TOKEN/);
++  });
++  it('rejects obvious placeholder tokens without printing their value', () => {
++    assert.throws(() => assertProductionConfig(prod, auth('<set-in-hosting-dashboard>')), /must not be a placeholder/);
++  });
++  it('rejects debug logging in production', () => {
++    assert.deepEqual(collectProductionProblems({ ...prod, logLevel: 'debug' }, auth('valid-token-123456')), ['LOG_LEVEL must not be "debug" in production']);
++  });
++  it('does not alter development or test configuration', () => {
++    for (const env of ['development', 'test']) {
++      assert.deepEqual(collectProductionProblems({ env, logLevel: 'debug' }, { enabled: false, token: null }), []);
++    }
++  });
++});
+
+diff --git a/B2.4-REPORT.md b/B2.4-REPORT.md
+new file mode 100644
+--- /dev/null
++++ b/B2.4-REPORT.md
+@@ -0,0 +1,30 @@
++# Phase 05-B2.4 — Security Hardening & QA
++
++## Scope
++
++- Central redaction for logger messages and structured fields (credential-shaped strings, sensitive property names, and explicitly supplied secret values).
++- Safe client error mapping: unexpected errors become generic 500 responses; 5xx AppError messages/details/headers are not exposed.
++- Production guard rejects missing/placeholder client tokens and `LOG_LEVEL=debug`.
++- No new runtime dependencies or environment variables.
++
++## Integration points
++
++- `src/index.js` invokes the production guard after configuration/auth loading and supplies the client token to the logger redactor.
++- `src/infrastructure/http/server.js` uses the safe error mapper and bounded error description for logs.
++
++## Tests
++
++Four Node.js built-in test files are included: `redact.test.js`, `loggerRedaction.test.js`, `errorResponse.test.js`, and `productionGuard.test.js`. They are discovered by the existing `node --test test/*.test.js` script.
++
++**Test status: NOT RUN HERE.** Per project workflow, GitHub Actions must execute the full suite on Node 20 and Node 22 after the branch is pushed and a pull request is opened. No PASS claim is made in this report.
++
++## Compatibility notes
++
++- Existing `createLogger(level, write)` callers remain valid; the optional third argument is additive.
++- Production token minimum length is unchanged to avoid invalidating existing deployment tokens.
++- Production CORS `http://` entries are not newly prohibited; use HTTPS origins for public production clients.
++- No provider integration, Gemini key loading, hosting deployment, or Android integration is included.
++
++## Operational note
++
++If the hosting environment currently sets `LOG_LEVEL=debug`, change it to `info`, `warn`, or `error` before deploying this phase. Never put real credentials in the repository or ZIP.
+
+diff --git a/CHANGED_FILES-B2.4.md b/CHANGED_FILES-B2.4.md
+new file mode 100644
+--- /dev/null
++++ b/CHANGED_FILES-B2.4.md
+@@ -0,0 +1,23 @@
++# Phase 05-B2.4 — Changed files
++
++## Updated
++- `src/infrastructure/http/server.js` — safe client error mapping and bounded/redacted error logging.
++- `src/index.js` — production guard and exact client-token redaction in logger.
++- `src/infrastructure/logging/logger.js` — redact every log message and structured field; backward-compatible signature.
++- `README.md` — current security status and test instructions.
++- `SECURITY-NOTES.md` — replace obsolete B1 security statements.
++- `.env.example` — document production logging constraint; no secret values.
++
++## Added
++- `src/infrastructure/logging/redact.js`
++- `src/infrastructure/http/errorResponse.js`
++- `src/config/productionGuard.js`
++- `test/redact.test.js`
++- `test/loggerRedaction.test.js`
++- `test/errorResponse.test.js`
++- `test/productionGuard.test.js`
++- `B2.4-REPORT.md`
++- `CHANGED_FILES-B2.4.md`
++- `TERMUX-PUSH-GUIDE.md`
++
++No package.json or CI workflow changes are required: the project already uses Node.js built-in tests with the glob `test/*.test.js` and a Node 20/22 CI matrix.
+
+diff --git a/SECURITY-NOTES.md b/SECURITY-NOTES.md
+new file mode 100644
+--- /dev/null
++++ b/SECURITY-NOTES.md
+@@ -0,0 +1,27 @@
++# SECURITY-NOTES.md — updated through Phase 05-B2.4
++
++## Secret handling
++- Never commit real API keys, client tokens, `.env` files, private keys, or provider credentials. Keep deployment secrets in the hosting provider's secret/environment settings.
++- `GATEWAY_CLIENT_TOKEN` protects `POST /v1/translate`; `GET /health` remains public. Production startup requires a non-placeholder client token.
++- `Secret` wrappers redact during string/JSON/inspect conversion. The logger additionally redacts sensitive property names, common credential patterns, and the configured client token's exact value.
++- Redaction is defense in depth, not permission to log request bodies, authorization headers, cookies, provider payloads, or novel text. Do not log those values.
++
++## HTTP and error handling
++- CORS allowlist, security headers, authentication, rate limiting, request content-type/size/timeout checks remain active.
++- Unexpected errors map to a generic `500 INTERNAL_ERROR`; stack traces and internal messages are not returned to clients. For `AppError` status 500+, message/details/extra headers are suppressed. Client-safe 4xx messages are passed through redaction.
++- Server-side error logs contain a bounded error name/message after shape-based redaction; 5xx `AppError` logs contain only request ID and stable error code. Avoid adding raw upstream errors to logs.
++
++## Production configuration
++- `PORT` and `GATEWAY_CLIENT_TOKEN` remain required in production. Obvious placeholder token values are rejected.
++- `LOG_LEVEL=debug` is rejected in production; use `info`, `warn`, `error`, or `silent`. Existing token minimum length is unchanged.
++- For public production browser clients, configure HTTPS origins in `GATEWAY_CORS_ALLOWED_ORIGINS`. The application does not newly reject HTTP origins because local development examples remain supported.
++
++## Remaining limitations
++- Pattern-based redaction cannot guarantee detection of every possible credential format. Never pass arbitrary provider error objects or request headers to logs.
++- Rate-limit state is in-memory and per process; distributed limits and quota management are not included.
++- TLS termination and secret storage at rest are hosting-platform responsibilities and must be verified for the selected host.
++- Git history is not scanned by the runtime test. If a credential was ever committed, revoke/rotate it; deleting the current file is insufficient.
++
++## Verification
++- B2.4 adds built-in Node tests for redaction, logger safety, client error mapping, and production guard behavior.
++- Tests are not claimed as passed until GitHub Actions completes on Node 20 and Node 22 for the B2.4 pull request.
+
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,0 +1,10 @@
++
++## Security Hardening (Phase 05-B2.4)
++
++- Logger output is redacted for sensitive field names, common credential formats, Bearer/Authorization values, and the configured client token. Do not log request bodies, novel text, raw headers, or provider payloads.
++- Unexpected errors return a generic `500 INTERNAL_ERROR`. For server-side `AppError` responses (5xx), internal message/details/extra headers are suppressed.
++- Production startup rejects missing or obvious placeholder `GATEWAY_CLIENT_TOKEN` values and rejects `LOG_LEVEL=debug`. Existing token length requirements are unchanged.
++- If the hosting dashboard currently sets `LOG_LEVEL=debug`, change it to `info` (or `warn`/`error`) before deploying B2.4.
++- Tests are run by GitHub Actions using Node 20 and 22; do not treat the phase as verified until both jobs pass.
+diff --git a/TERMUX-PUSH-GUIDE.md b/TERMUX-PUSH-GUIDE.md
+new file mode 100644
+--- /dev/null
++++ b/TERMUX-PUSH-GUIDE.md
+@@ -0,0 +1,42 @@
++# Termux Git Push Guide — Phase 05-B2.4
++
++> Tests are intentionally run by GitHub Actions, not locally. Do not run `npm test` in Termux for this phase.
++
++```bash
++cd ~/NB-Translation-Gateway
++git status --short
++git switch main
++git pull origin main
++git switch -c phase-05-b2.4-security-hardening
++```
++
++Extract the ZIP into a temporary folder. Replace the path if Android saved it somewhere else:
++
++```bash
++mkdir -p ~/storage/downloads/B2.4
++unzip -o ~/storage/downloads/B2.4-Security-Hardening.zip -d ~/storage/downloads/B2.4
++cd ~/NB-Translation-Gateway
++git apply --check ~/storage/downloads/B2.4/B2.4.patch
++```
++
++If the check succeeds, apply the complete patch (it adds the new source/test/docs files and updates the two existing source files plus README):
++
++```bash
++git apply ~/storage/downloads/B2.4/B2.4.patch
++git status --short
++git diff --stat
++```
++
++If `git apply --check` reports a conflict, STOP and send the error. Do not force-apply. Do not copy ZIP source/test files separately before applying the patch, because the patch already adds them.
++
++Commit and push:
++
++```bash
++git add src test README.md SECURITY-NOTES.md B2.4-REPORT.md CHANGED_FILES-B2.4.md TERMUX-PUSH-GUIDE.md
++git commit -m "feat: Phase 05-B2.4 security hardening"
++git push -u origin phase-05-b2.4-security-hardening
++```
++
++Then open a Pull Request on GitHub from `phase-05-b2.4-security-hardening` into `main`. Wait for the `test` workflow's Node 20 and Node 22 jobs. Merge only when both pass.
++
++Security note: do not put real API keys/client tokens into Git, the ZIP, terminal screenshots, or chat. If hosting currently uses `LOG_LEVEL=debug`, change it to `info`, `warn`, or `error` before deploying this phase.
