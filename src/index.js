@@ -1,5 +1,6 @@
 import { loadAuthConfig } from './config/auth.js';
 import { loadConfig } from './config/config.js';
+import { assertProductionConfig } from './config/productionGuard.js';
 import { EnvSecretProvider } from './config/secrets.js';
 import { loadTranslationProviderConfig } from './config/translationProvider.js';
 import { ConfigError } from './domain/errors.js';
@@ -15,6 +16,11 @@ try {
   const secrets = new EnvSecretProvider(process.env);
   // Production without GATEWAY_CLIENT_TOKEN throws here -> exit 1 below.
   auth = loadAuthConfig(config, secrets);
+  // Phase 05-B4: production-only guard (placeholder / weak client token,
+  // LOG_LEVEL=debug). It throws a ConfigError that names variables only, which
+  // exits 1 below - before the logger, the provider or the HTTP server exist.
+  // It does nothing in development and test.
+  assertProductionConfig(config, auth);
   // Phase 05-B3: TRANSLATION_PROVIDER=gemini without its API key (or with an
   // invalid provider setting) also stops startup. `none` (default) reads nothing.
   providerConfig = loadTranslationProviderConfig(process.env, secrets);
