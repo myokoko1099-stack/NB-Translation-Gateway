@@ -1,0 +1,1623 @@
+diff --git a/test/cors.test.js b/test/cors.test.js
+new file mode 100644
+index 0000000..164ba4e
+--- /dev/null
++++ b/test/cors.test.js
+@@ -0,0 +1,492 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import { CORS_ORIGINS_VAR, loadConfig } from '../src/config/config.js';
++import { ConfigError } from '../src/domain/errors.js';
++import {
++  TOKEN,
++  VALID,
++  UUID,
++  assertError,
++  assertNoCorsGrant,
++  assertSecurityHeaders,
++  bearer,
++  countingProvider,
++  get,
++  postJsonRaw,
++  preflight,
++  rawRequest,
++  varyTokens,
++  withServer,
++} from './httpTestKit.js';
++import { startTestServer } from './helpers.js';
++
++const ALLOWED = 'https://app.example.com';
++const ALLOWED_2 = 'http://localhost:3000';
++const EVIL = 'https://evil.example.org';
++
++const ENV = {
++  GATEWAY_CLIENT_TOKEN: TOKEN,
++  GATEWAY_RATE_LIMIT_MAX: '1000',
++  [CORS_ORIGINS_VAR]: ` ${ALLOWED} , ${ALLOWED_2} `,
++};
++
++/* ------------------------------------------------------------------ */
++describe('CORS - allowed origin', () => {
++  it('GET /health from an allowed origin echoes THAT origin (never "*")', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      for (const origin of [ALLOWED, ALLOWED_2]) {
++        const res = await get(srv.baseUrl, '/health', { origin });
++        assert.equal(res.status, 200);
++        assert.equal(res.headers['access-control-allow-origin'], origin);
++        assert.notEqual(res.headers['access-control-allow-origin'], '*');
++        assert.ok(varyTokens(res).includes('origin'));
++      }
++    });
++  });
++
++  it('exposes the documented response headers and never enables credentials', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await get(srv.baseUrl, '/health', { origin: ALLOWED });
++      const exposed = String(res.headers['access-control-expose-headers'])
++        .split(',')
++        .map((s) => s.trim().toLowerCase());
++      for (const name of ['x-request-id', 'retry-after', 'ratelimit-limit', 'ratelimit-remaining', 'ratelimit-reset']) {
++        assert.ok(exposed.includes(name), `${name} should be exposed`);
++      }
++      assert.equal(res.headers['access-control-allow-credentials'], undefined);
++    });
++  });
++
++  it('POST /v1/translate from an allowed origin works and carries the CORS header', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, VALID, { ...bearer(), origin: ALLOWED });
++      assert.equal(res.status, 200);
++      assert.equal(res.headers['access-control-allow-origin'], ALLOWED);
++      assert.equal(res.json().translatedText, 'ok');
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('error responses (400 / 401 / 404) also carry the CORS header so the browser can read them', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const unauth = await postJsonRaw(srv.baseUrl, VALID, { origin: ALLOWED });
++      assertError(unauth, 401, 'UNAUTHORIZED');
++      assert.equal(unauth.headers['access-control-allow-origin'], ALLOWED);
++
++      const invalid = await postJsonRaw(srv.baseUrl, {}, { ...bearer(), origin: ALLOWED });
++      assertError(invalid, 400, 'INVALID_REQUEST');
++      assert.equal(invalid.headers['access-control-allow-origin'], ALLOWED);
++
++      const missing = await get(srv.baseUrl, '/nope', { origin: ALLOWED });
++      assertError(missing, 404, 'NOT_FOUND');
++      assert.equal(missing.headers['access-control-allow-origin'], ALLOWED);
++    });
++  });
++
++  it('a rate-limited (429) response carries the CORS header and Retry-After', async () => {
++    const provider = countingProvider();
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider }, async (srv) => {
++      const headers = { ...bearer(), origin: ALLOWED };
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, headers)).status, 200);
++      const limited = await postJsonRaw(srv.baseUrl, VALID, headers);
++      assertError(limited, 429, 'RATE_LIMITED');
++      assert.equal(limited.headers['access-control-allow-origin'], ALLOWED);
++      assert.match(limited.headers['retry-after'], /^[1-9]\d*$/);
++      assert.equal(provider.calls, 1);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - disallowed origin', () => {
++  const DISALLOWED = [
++    EVIL,
++    'http://app.example.com', // scheme differs
++    'https://app.example.com:8443', // port differs
++    'https://APP.EXAMPLE.COM', // exact (case-sensitive) match only
++    'https://app.example.com/', // trailing slash
++    'https://sub.app.example.com',
++    'https://app.example.com.evil.test',
++    '*',
++    '',
++  ];
++
++  it('every disallowed Origin value -> 403 ORIGIN_NOT_ALLOWED, no CORS grant, connection closed', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const origin of DISALLOWED) {
++        const res = await get(srv.baseUrl, '/health', { origin });
++        const label = JSON.stringify(origin);
++        assertError(res, 403, 'ORIGIN_NOT_ALLOWED');
++        assertNoCorsGrant(res, label);
++        assert.equal(res.headers.connection, 'close', label);
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('is decided BEFORE authentication, rate limiting, body parsing and the provider', async () => {
++    const provider = countingProvider();
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider }, async (srv) => {
++      // Valid token, valid body, bad origin -> still 403 and the provider is untouched.
++      for (let i = 0; i < 3; i += 1) {
++        const res = await postJsonRaw(srv.baseUrl, VALID, { ...bearer(), origin: EVIL });
++        assertError(res, 403, 'ORIGIN_NOT_ALLOWED');
++      }
++      // No token + bad origin -> 403 (origin check runs first), not 401.
++      assertError(await postJsonRaw(srv.baseUrl, VALID, { origin: EVIL }), 403, 'ORIGIN_NOT_ALLOWED');
++      assert.equal(provider.calls, 0);
++      // The rejected requests did not consume the rate-limit budget.
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('also applies to unknown routes (403, not 404)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assertError(await get(srv.baseUrl, '/nope', { origin: EVIL }), 403, 'ORIGIN_NOT_ALLOWED');
++    });
++  });
++
++  it('the rejected origin value is not logged; the rejection itself is', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const sentinel = 'https://sentinel-rejected-origin.test';
++      assertError(await get(srv.baseUrl, '/health', { origin: sentinel }), 403, 'ORIGIN_NOT_ALLOWED');
++      const logs = srv.logs.join('\n');
++      assert.ok(logs.includes('origin rejected'));
++      assert.ok(!logs.includes('sentinel-rejected-origin'));
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - request without an Origin header (native Android / curl)', () => {
++  it('is allowed and receives no CORS headers', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const health = await get(srv.baseUrl, '/health');
++      assert.equal(health.status, 200);
++      assertNoCorsGrant(health);
++
++      const translate = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assert.equal(translate.status, 200);
++      assertNoCorsGrant(translate);
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('works the same when the allowlist is configured and when it is empty', async () => {
++    for (const env of [ENV, { GATEWAY_CLIENT_TOKEN: TOKEN }]) {
++      await withServer(env, { provider: countingProvider() }, async (srv) => {
++        assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++      });
++    }
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - literal "null" origin', () => {
++  it('is rejected with 403 even when other origins are allowed', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await get(srv.baseUrl, '/health', { origin: 'null' });
++      assertError(res, 403, 'ORIGIN_NOT_ALLOWED');
++      assertNoCorsGrant(res);
++    });
++  });
++
++  it('is rejected for POST and for a preflight too', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      assertError(await postJsonRaw(srv.baseUrl, VALID, { ...bearer(), origin: 'null' }), 403, 'ORIGIN_NOT_ALLOWED');
++      assertError(await preflight(srv.baseUrl, { origin: 'null' }), 403, 'ORIGIN_NOT_ALLOWED');
++      assert.equal(provider.calls, 0);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - empty allowlist', () => {
++  for (const [label, value] of [
++    ['variable unset', undefined],
++    ['empty string', ''],
++    ['whitespace only', '   '],
++    ['only separators', ' , ,'],
++  ]) {
++    it(`${label}: config has no origins, every browser origin is rejected, native clients still work`, async () => {
++      const env = { GATEWAY_CLIENT_TOKEN: TOKEN };
++      if (value !== undefined) env[CORS_ORIGINS_VAR] = value;
++      assert.deepEqual([...loadConfig(env).cors.allowedOrigins], []);
++
++      const provider = countingProvider();
++      await withServer(env, { provider }, async (srv) => {
++        for (const origin of [ALLOWED, ALLOWED_2, 'null', EVIL]) {
++          assertError(await get(srv.baseUrl, '/health', { origin }), 403, 'ORIGIN_NOT_ALLOWED');
++        }
++        assertError(await preflight(srv.baseUrl, { origin: ALLOWED }), 403, 'ORIGIN_NOT_ALLOWED');
++        assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++        assert.equal(provider.calls, 1);
++      });
++    });
++  }
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - configuration validation (wildcards and malformed entries are rejected)', () => {
++  const load = (value) => loadConfig({ [CORS_ORIGINS_VAR]: value });
++
++  it('a wildcard entry fails startup configuration and is never turned into "allow all"', async () => {
++    for (const value of ['*', 'https://*.example.com', '*.example.com', `${ALLOWED},*`]) {
++      assert.throws(
++        () => load(value),
++        (e) => e instanceof ConfigError && e.problems.some((p) => p.startsWith(CORS_ORIGINS_VAR)),
++        value,
++      );
++    }
++    await assert.rejects(startTestServer({ [CORS_ORIGINS_VAR]: '*' }), ConfigError);
++  });
++
++  it('other non-canonical entries are rejected too', () => {
++    const bad = [
++      'null',
++      'app.example.com',
++      'ftp://app.example.com',
++      'chrome-extension://abcdefghijklmnop',
++      'https://app.example.com/',
++      'https://app.example.com/path',
++      'https://app.example.com?x=1',
++      'https://app.example.com#frag',
++      'https://user:pw@app.example.com',
++      'HTTPS://APP.EXAMPLE.COM',
++      'https://app.example.com:443', // default port must be omitted
++      'http://app.example.com:80',
++      `https://${'a'.repeat(250)}.com`, // longer than 255 characters
++    ];
++    for (const value of bad) {
++      assert.throws(() => load(value), ConfigError, value);
++    }
++  });
++
++  it('one bad entry rejects the whole list (no partial acceptance) and names only its position', () => {
++    try {
++      load(`${ALLOWED}, https://sentinel-leak-check.test/path`);
++      assert.fail('expected ConfigError');
++    } catch (e) {
++      assert.ok(e instanceof ConfigError);
++      assert.equal(e.problems.length, 1);
++      assert.ok(e.problems[0].startsWith(`${CORS_ORIGINS_VAR} entry 2`));
++      assert.ok(!e.problems.join('\n').includes('sentinel-leak-check'), 'entry value must not be echoed');
++      assert.ok(!e.message.includes('sentinel-leak-check'));
++    }
++  });
++
++  it('valid lists are trimmed and de-duplicated; scheme, host and non-default port are kept', () => {
++    const c = load(` ${ALLOWED} ,${ALLOWED_2},${ALLOWED}, https://app.example.com:8443 `);
++    assert.deepEqual([...c.cors.allowedOrigins], [ALLOWED, ALLOWED_2, 'https://app.example.com:8443']);
++    assert.ok(Object.isFrozen(c.cors));
++    assert.ok(Object.isFrozen(c.cors.allowedOrigins));
++  });
++
++  it('at most 50 origins are accepted', () => {
++    const make = (n) => Array.from({ length: n }, (_, i) => `https://o${i}.example.com`).join(',');
++    assert.equal(load(make(50)).cors.allowedOrigins.length, 50);
++    assert.throws(() => load(make(51)), (e) => e instanceof ConfigError && e.problems[0].startsWith(CORS_ORIGINS_VAR));
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - OPTIONS preflight', () => {
++  it('valid preflight -> 204, empty body, full set of CORS headers', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await preflight(srv.baseUrl, { origin: ALLOWED });
++      assert.equal(res.status, 204);
++      assert.equal(res.text, '');
++      assert.equal(res.headers['access-control-allow-origin'], ALLOWED);
++      assert.equal(res.headers['access-control-allow-methods'], 'POST');
++      assert.equal(res.headers['access-control-allow-headers'], 'authorization, content-type');
++      assert.equal(res.headers['access-control-max-age'], '600');
++      assert.equal(res.headers['access-control-allow-credentials'], undefined);
++      assert.match(res.headers['x-request-id'], UUID);
++    });
++  });
++
++  it('allowed methods are those of the matched route (GET for /health)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await preflight(srv.baseUrl, { path: '/health', origin: ALLOWED, method: 'GET', requestHeaders: null });
++      assert.equal(res.status, 204);
++      assert.equal(res.headers['access-control-allow-methods'], 'GET');
++    });
++  });
++
++  it('request-header names are matched case-insensitively', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await preflight(srv.baseUrl, { origin: ALLOWED_2, requestHeaders: 'Authorization,  CONTENT-TYPE' });
++      assert.equal(res.status, 204);
++      assert.equal(res.headers['access-control-allow-origin'], ALLOWED_2);
++    });
++  });
++
++  it('a preflight without Access-Control-Request-Headers is accepted', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assert.equal((await preflight(srv.baseUrl, { origin: ALLOWED, requestHeaders: null })).status, 204);
++    });
++  });
++
++  it('needs no Authorization and does not consume the rate-limit budget or call the provider', async () => {
++    const provider = countingProvider();
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider }, async (srv) => {
++      for (let i = 0; i < 5; i += 1) {
++        assert.equal((await preflight(srv.baseUrl, { origin: ALLOWED })).status, 204);
++      }
++      assert.equal(provider.calls, 0);
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200, 'budget untouched by preflights');
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 429);
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('a preflight from a disallowed origin -> 403 ORIGIN_NOT_ALLOWED with no CORS grant', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await preflight(srv.baseUrl, { origin: EVIL });
++      assertError(res, 403, 'ORIGIN_NOT_ALLOWED');
++      assertNoCorsGrant(res);
++    });
++  });
++
++  it('a preflight for an unknown route -> 404 (route lookup precedes the preflight)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assertError(await preflight(srv.baseUrl, { path: '/nope', origin: ALLOWED }), 404, 'NOT_FOUND');
++    });
++  });
++
++  it('OPTIONS without Access-Control-Request-Method is not a preflight -> 405 (with or without Origin)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      for (const origin of [ALLOWED, null]) {
++        const res = await preflight(srv.baseUrl, { origin, method: null, requestHeaders: null });
++        assertError(res, 405, 'METHOD_NOT_ALLOWED');
++        assert.equal(res.headers.allow, 'POST');
++      }
++    });
++  });
++
++  it('OPTIONS + Access-Control-Request-Method but NO Origin is not treated as a preflight -> 405', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await preflight(srv.baseUrl, { origin: null });
++      assertError(res, 405, 'METHOD_NOT_ALLOWED');
++      assertNoCorsGrant(res);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - invalid preflight method', () => {
++  it('a method the route does not support -> 403 CORS_PREFLIGHT_REJECTED, no allow-methods grant', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const method of ['GET', 'PUT', 'DELETE', 'PATCH', 'post', 'TRACE', 'FOO']) {
++        const res = await preflight(srv.baseUrl, { origin: ALLOWED, method });
++        assertError(res, 403, 'CORS_PREFLIGHT_REJECTED');
++        for (const name of ['access-control-allow-methods', 'access-control-allow-headers', 'access-control-max-age']) {
++          assert.equal(res.headers[name], undefined, `${name} must be absent for ${method}`);
++        }
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('is per route: POST is refused for /health, GET is refused for /v1/translate', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assertError(await preflight(srv.baseUrl, { path: '/health', origin: ALLOWED, method: 'POST' }), 403, 'CORS_PREFLIGHT_REJECTED');
++      assertError(await preflight(srv.baseUrl, { origin: ALLOWED, method: 'GET' }), 403, 'CORS_PREFLIGHT_REJECTED');
++    });
++  });
++
++  it('the rejection is logged without the origin value', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      await preflight(srv.baseUrl, { origin: ALLOWED, method: 'DELETE' });
++      const logs = srv.logs.join('\n');
++      assert.ok(logs.includes('cors preflight rejected'));
++      assert.ok(!logs.includes(ALLOWED));
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - invalid preflight headers', () => {
++  it('any requested header outside {authorization, content-type} -> 403 CORS_PREFLIGHT_REJECTED', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const requestHeaders of [
++        'x-custom',
++        'x-api-key',
++        'authorization, x-evil', // one bad name poisons the list
++        'content-type,cookie',
++        'content-type, authorization, x-forwarded-for',
++        'Authorization, X-EVIL',
++      ]) {
++        const res = await preflight(srv.baseUrl, { origin: ALLOWED, requestHeaders });
++        assertError(res, 403, 'CORS_PREFLIGHT_REJECTED');
++        assert.equal(res.headers['access-control-allow-headers'], undefined, requestHeaders);
++        assert.equal(res.headers['access-control-max-age'], undefined, requestHeaders);
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - Vary: Origin', () => {
++  it('is present on success, error, 404, 403, 405, 204 and native (no Origin) responses', async () => {
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider: countingProvider() }, async (srv) => {
++      const cases = {
++        'native 200': await get(srv.baseUrl, '/health'),
++        'allowed 200': await get(srv.baseUrl, '/health', { origin: ALLOWED }),
++        'denied 403': await get(srv.baseUrl, '/health', { origin: EVIL }),
++        'null-origin 403': await get(srv.baseUrl, '/health', { origin: 'null' }),
++        'native 404': await get(srv.baseUrl, '/nope'),
++        'allowed 404': await get(srv.baseUrl, '/nope', { origin: ALLOWED }),
++        '405': await rawRequest(srv.baseUrl, { method: 'GET', path: '/v1/translate' }),
++        '401': await postJsonRaw(srv.baseUrl, VALID),
++        '204 preflight': await preflight(srv.baseUrl, { origin: ALLOWED }),
++        '403 preflight rejected': await preflight(srv.baseUrl, { origin: ALLOWED, method: 'DELETE' }),
++      };
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++      cases['429'] = await postJsonRaw(srv.baseUrl, VALID, bearer());
++
++      for (const [label, res] of Object.entries(cases)) {
++        assert.ok(varyTokens(res).includes('origin'), `Vary must include Origin: ${label} (got "${res.headers.vary}")`);
++      }
++      assert.equal(cases['429'].status, 429);
++      assert.equal(cases['204 preflight'].status, 204);
++    });
++  });
++
++  it('the preflight 204 also varies on the request-method and request-headers', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await preflight(srv.baseUrl, { origin: ALLOWED });
++      const tokens = varyTokens(res);
++      for (const t of ['origin', 'access-control-request-method', 'access-control-request-headers']) {
++        assert.ok(tokens.includes(t), `Vary should include ${t}`);
++      }
++    });
++  });
++
++  it('is present even when the allowlist is empty', async () => {
++    await withServer({ GATEWAY_CLIENT_TOKEN: TOKEN }, {}, async (srv) => {
++      assert.ok(varyTokens(await get(srv.baseUrl, '/health')).includes('origin'));
++      assert.ok(varyTokens(await get(srv.baseUrl, '/health', { origin: EVIL })).includes('origin'));
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('CORS - security headers still accompany every CORS outcome', () => {
++  it('allowed, denied, preflight 204 and preflight 403 all carry the security headers', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assertSecurityHeaders(await get(srv.baseUrl, '/health', { origin: ALLOWED }), 'allowed');
++      assertSecurityHeaders(await get(srv.baseUrl, '/health', { origin: EVIL }), 'denied');
++      assertSecurityHeaders(await preflight(srv.baseUrl, { origin: ALLOWED }), 'preflight 204');
++      assertSecurityHeaders(await preflight(srv.baseUrl, { origin: ALLOWED, method: 'PUT' }), 'preflight 403');
++    });
++  });
++});
+diff --git a/test/httpProtection.test.js b/test/httpProtection.test.js
+new file mode 100644
+index 0000000..47f115c
+--- /dev/null
++++ b/test/httpProtection.test.js
+@@ -0,0 +1,315 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import {
++  TOKEN,
++  VALID,
++  assertError,
++  assertSecurityHeaders,
++  bearer,
++  countingProvider,
++  post,
++  postJsonRaw,
++  withServer,
++} from './httpTestKit.js';
++
++const MAX = 1024;
++const ENV = {
++  GATEWAY_CLIENT_TOKEN: TOKEN,
++  GATEWAY_RATE_LIMIT_MAX: '1000',
++  MAX_BODY_BYTES: String(MAX),
++  REQUEST_TIMEOUT_MS: '1000', // the minimum the config accepts
++};
++
++const JSON_BODY = JSON.stringify(VALID);
++
++/** POST with an explicit Content-Type (undefined = header omitted). */
++function postWithType(baseUrl, contentType, body = JSON_BODY, extra = {}) {
++  const headers = { ...bearer(), 'content-length': Buffer.byteLength(body), ...extra };
++  if (contentType !== undefined) headers['content-type'] = contentType;
++  return post(baseUrl, { headers, body });
++}
++
++function assertClosed(res, label) {
++  assert.equal(res.headers.connection, 'close', `Connection: close expected [${label}]`);
++  assertSecurityHeaders(res, label);
++}
++
++/* ------------------------------------------------------------------ */
++describe('HTTP protection - Content-Type -> 415', () => {
++  it('missing Content-Type -> 415 UNSUPPORTED_MEDIA_TYPE, provider not called', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await postWithType(srv.baseUrl, undefined);
++      assertError(res, 415, 'UNSUPPORTED_MEDIA_TYPE');
++      assertClosed(res, 'missing content-type');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('invalid media types -> 415', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const type of [
++        'text/plain',
++        'text/json',
++        'application/xml',
++        'application/x-www-form-urlencoded',
++        'multipart/form-data; boundary=x',
++        'application/jsonp',
++        'application/json-patch+json',
++        'application/vnd.api+json',
++        'application/octet-stream',
++        '',
++      ]) {
++        const res = await postWithType(srv.baseUrl, type);
++        assertError(res, 415, 'UNSUPPORTED_MEDIA_TYPE');
++        assertClosed(res, `content-type "${type}"`);
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('application/json is accepted case-insensitively, with or without a UTF-8 charset', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const accepted = [
++        'application/json',
++        'APPLICATION/JSON',
++        'application/json; charset=utf-8',
++        'application/json; charset=UTF-8',
++        'application/json;charset=utf8',
++        'application/json; charset="utf-8"',
++      ];
++      for (const type of accepted) {
++        const res = await postWithType(srv.baseUrl, type);
++        assert.equal(res.status, 200, type);
++      }
++      assert.equal(provider.calls, accepted.length);
++    });
++  });
++
++  it('the 415 body does not echo the submitted Content-Type', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postWithType(srv.baseUrl, 'text/x-sentinel-media-type');
++      assertError(res, 415, 'UNSUPPORTED_MEDIA_TYPE');
++      assert.ok(!res.text.includes('sentinel-media-type'));
++      assert.ok(!srv.logs.join('\n').includes('sentinel-media-type'));
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('HTTP protection - invalid charset -> 415', () => {
++  it('any charset other than UTF-8 -> 415, provider not called', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const type of [
++        'application/json; charset=iso-8859-1',
++        'application/json; charset=utf-16',
++        'application/json; charset=us-ascii',
++        'application/json; charset=ascii',
++        'application/json; charset=utf-8x',
++        'application/json; charset="latin1"',
++        'application/json; charset=',
++        'application/json; CHARSET=Shift_JIS',
++      ]) {
++        const res = await postWithType(srv.baseUrl, type);
++        assertError(res, 415, 'UNSUPPORTED_MEDIA_TYPE');
++        assertClosed(res, type);
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('HTTP protection - oversized body -> 413', () => {
++  it('oversized Content-Length with the full body sent -> 413 PAYLOAD_TOO_LARGE', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, 'x'.repeat(MAX + 1), bearer());
++      assertError(res, 413, 'PAYLOAD_TOO_LARGE');
++      assertClosed(res, '413 content-length');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('boundary: exactly MAX_BODY_BYTES is accepted, one byte more is refused', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const padded = JSON_BODY + ' '.repeat(MAX - Buffer.byteLength(JSON_BODY));
++      assert.equal(Buffer.byteLength(padded), MAX);
++      assert.equal((await postJsonRaw(srv.baseUrl, padded, bearer())).status, 200);
++      assertError(await postJsonRaw(srv.baseUrl, `${padded} `, bearer()), 413, 'PAYLOAD_TOO_LARGE');
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('an oversized DECLARED length is refused immediately, without waiting for the body', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      // Only a few bytes are sent and the request is never finished; the server must
++      // answer from the header alone instead of waiting for (or timing out on) the body.
++      const startedAt = Date.now();
++      const res = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'content-length': '99999999' },
++        hold: '{"a":',
++      });
++      assertError(res, 413, 'PAYLOAD_TOO_LARGE');
++      assertClosed(res, '413 declared');
++      assert.ok(Date.now() - startedAt < 900, 'must not wait for the request timeout (1000 ms)');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('oversized STREAMED (chunked, no Content-Length) body -> 413', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'transfer-encoding': 'chunked' },
++        chunks: ['a'.repeat(512), 'b'.repeat(512), 'c'.repeat(512), 'd'.repeat(512)],
++      });
++      assertError(res, 413, 'PAYLOAD_TOO_LARGE');
++      assertClosed(res, '413 streamed');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('a streamed body within the limit is accepted', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const half = Math.floor(JSON_BODY.length / 2);
++      const res = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'transfer-encoding': 'chunked' },
++        chunks: [JSON_BODY.slice(0, half), JSON_BODY.slice(half)],
++      });
++      assert.equal(res.status, 200);
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('413 is evaluated after Content-Type: wrong type + oversized length -> 415', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postWithType(srv.baseUrl, 'text/plain', 'x'.repeat(MAX + 1));
++      assertError(res, 415, 'UNSUPPORTED_MEDIA_TYPE');
++    });
++  });
++
++  it('the 413 body and logs never contain the submitted payload', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, 'SENTINEL-OVERSIZED-PAYLOAD'.repeat(100), bearer());
++      assertError(res, 413, 'PAYLOAD_TOO_LARGE');
++      assert.ok(!res.text.includes('SENTINEL-OVERSIZED'));
++      assert.ok(!srv.logs.join('\n').includes('SENTINEL-OVERSIZED'));
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('HTTP protection - incomplete body -> 408', () => {
++  it('a body that never completes -> 408 REQUEST_TIMEOUT, provider not called', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const startedAt = Date.now();
++      const res = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'content-length': '200' },
++        hold: '{"sourceLanguage":"ja",',
++      });
++      assertError(res, 408, 'REQUEST_TIMEOUT');
++      assertClosed(res, '408');
++      assert.ok(Date.now() - startedAt >= 900, 'should have waited for the configured timeout');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('a chunked body that never ends -> 408', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'transfer-encoding': 'chunked' },
++        hold: '{"sourceLanguage":"ja"',
++      });
++      assertError(res, 408, 'REQUEST_TIMEOUT');
++      assert.equal(provider.calls, 0);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('HTTP protection - invalid JSON and empty body -> 400', () => {
++  it('malformed JSON -> 400 INVALID_JSON, provider not called', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const body of ['{not json', '{"a":', '{"a":1,}', "{'a':1}", 'undefined', 'hello', '{"a":1}}', '\u0000']) {
++        const res = await postJsonRaw(srv.baseUrl, body, bearer());
++        const parsed = assertError(res, 400, 'INVALID_JSON');
++        assert.equal(parsed.error.message, 'Request body is not valid JSON.');
++        assertSecurityHeaders(res, `invalid json ${JSON.stringify(body)}`);
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('empty body (Content-Length: 0) -> 400 INVALID_JSON "Request body is required."', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, '', bearer());
++      const parsed = assertError(res, 400, 'INVALID_JSON');
++      assert.equal(parsed.error.message, 'Request body is required.');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('no body at all (no Content-Length, nothing written) -> 400', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await post(srv.baseUrl, { headers: { ...bearer(), 'content-type': 'application/json' } });
++      assertError(res, 400, 'INVALID_JSON');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('a whitespace-only body is not valid JSON -> 400', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assertError(await postJsonRaw(srv.baseUrl, '   \n  ', bearer()), 400, 'INVALID_JSON');
++    });
++  });
++
++  it('valid JSON that is not a request object -> 400 INVALID_REQUEST (never a 500)', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const body of ['null', '[]', '"text"', '42', 'true']) {
++        assertError(await postJsonRaw(srv.baseUrl, body, bearer()), 400, 'INVALID_REQUEST');
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('the 400 body and logs never contain the submitted payload', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, '{"secret":"SENTINEL-BODY-VALUE" oops', bearer());
++      assertError(res, 400, 'INVALID_JSON');
++      assert.ok(!res.text.includes('SENTINEL-BODY-VALUE'));
++      assert.ok(!srv.logs.join('\n').includes('SENTINEL-BODY-VALUE'));
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('HTTP protection - server keeps working after rejected requests', () => {
++  it('a valid request succeeds right after 415 / 413 / 408 / 400 rejections', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      await postWithType(srv.baseUrl, 'text/plain');
++      await postJsonRaw(srv.baseUrl, 'x'.repeat(MAX + 1), bearer());
++      await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'content-length': '50' },
++        hold: '{',
++      });
++      await postJsonRaw(srv.baseUrl, '{bad', bearer());
++      const ok = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assert.equal(ok.status, 200);
++      assert.equal(provider.calls, 1);
++    });
++  });
++});
+diff --git a/test/httpSecurity.integration.test.js b/test/httpSecurity.integration.test.js
+new file mode 100644
+index 0000000..7da59ae
+--- /dev/null
++++ b/test/httpSecurity.integration.test.js
+@@ -0,0 +1,312 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import { createRateLimiter } from '../src/infrastructure/http/rateLimiter.js';
++import {
++  TOKEN,
++  VALID,
++  UUID,
++  assertError,
++  assertSecurityHeaders,
++  bearer,
++  countingProvider,
++  get,
++  post,
++  postJsonRaw,
++  preflight,
++  rawRequest,
++  withServer,
++} from './httpTestKit.js';
++
++const ALLOWED = 'https://app.example.com';
++const EVIL = 'https://evil.example.org';
++const MAX = 1024;
++
++const ENV = {
++  GATEWAY_CLIENT_TOKEN: TOKEN,
++  GATEWAY_RATE_LIMIT_MAX: '1000',
++  GATEWAY_CORS_ALLOWED_ORIGINS: ALLOWED,
++  MAX_BODY_BYTES: String(MAX),
++  REQUEST_TIMEOUT_MS: '1000',
++};
++
++/* ------------------------------------------------------------------ */
++describe('regression - authentication still works with B2.3 enabled', () => {
++  it('valid token -> 200; provider called exactly once', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assert.equal(res.status, 200);
++      assert.equal(res.json().translatedText, 'ok');
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('missing / wrong / malformed token -> 401 with WWW-Authenticate; provider never called', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const headers of [
++        {},
++        bearer('wrong-token-value'),
++        { authorization: `Basic ${TOKEN}` },
++        { authorization: 'Bearer' },
++        { authorization: `Bearer ${TOKEN} extra` },
++      ]) {
++        const res = await postJsonRaw(srv.baseUrl, VALID, headers);
++        const body = assertError(res, 401, 'UNAUTHORIZED');
++        assert.equal(res.headers['www-authenticate'], 'Bearer');
++        assert.ok(!res.text.includes(TOKEN));
++        assert.match(body.error.requestId, UUID);
++        assertSecurityHeaders(res, '401');
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('401 also works for a request from an allowed browser origin', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, VALID, { origin: ALLOWED });
++      assertError(res, 401, 'UNAUTHORIZED');
++      assert.equal(res.headers['access-control-allow-origin'], ALLOWED);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('regression - rate limiting still works with B2.3 enabled', () => {
++  it('N requests succeed with RateLimit-* headers, the next one is 429 with Retry-After', async () => {
++    const provider = countingProvider();
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '3' }, { provider }, async (srv) => {
++      for (const remaining of ['2', '1', '0']) {
++        const res = await postJsonRaw(srv.baseUrl, VALID, bearer());
++        assert.equal(res.status, 200);
++        assert.equal(res.headers['ratelimit-limit'], '3');
++        assert.equal(res.headers['ratelimit-remaining'], remaining);
++        assertSecurityHeaders(res, `200 remaining ${remaining}`);
++      }
++      const limited = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assertError(limited, 429, 'RATE_LIMITED');
++      assert.match(limited.headers['retry-after'], /^[1-9]\d*$/);
++      assert.equal(limited.headers['ratelimit-remaining'], '0');
++      assertSecurityHeaders(limited, '429');
++      assert.equal(provider.calls, 3, 'provider is not called for the limited request');
++    });
++  });
++
++  it('only authenticated requests create limiter records (unauthenticated floods and bad origins do not)', async () => {
++    const rateLimiter = createRateLimiter({ max: 5, windowMs: 60_000 });
++    await withServer(ENV, { rateLimiter }, async (srv) => {
++      for (let i = 0; i < 10; i += 1) {
++        await postJsonRaw(srv.baseUrl, VALID); // 401
++        await postJsonRaw(srv.baseUrl, VALID, bearer('wrong-token-value')); // 401
++        await postJsonRaw(srv.baseUrl, VALID, { ...bearer(), origin: EVIL }); // 403
++        await preflight(srv.baseUrl, { origin: ALLOWED }); // 204
++      }
++      assert.equal(rateLimiter.size(), 0);
++      await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assert.equal(rateLimiter.size(), 1);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('regression - pipeline order: Origin -> Auth -> Rate limit -> Body', () => {
++  const BAD_BODIES = {
++    'wrong Content-Type (415)': (extra) =>
++      post(extra.baseUrl, { headers: { ...extra.headers, 'content-type': 'text/plain', 'content-length': '1' }, body: 'x' }),
++    'oversized body (413)': (extra) => postJsonRaw(extra.baseUrl, 'x'.repeat(MAX + 1), extra.headers),
++    'invalid JSON (400)': (extra) => postJsonRaw(extra.baseUrl, '{not json', extra.headers),
++    'empty body (400)': (extra) => postJsonRaw(extra.baseUrl, '', extra.headers),
++  };
++
++  it('Auth before Body: with no token, bad bodies are answered 401, not 415 / 413 / 400', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      for (const [label, send] of Object.entries(BAD_BODIES)) {
++        const res = await send({ baseUrl: srv.baseUrl, headers: {} });
++        assertError(res, 401, 'UNAUTHORIZED');
++        assert.ok(res.status === 401, label);
++      }
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('Auth before Body: an unfinished body without a token is answered 401 at once (no 408 wait)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const startedAt = Date.now();
++      const res = await post(srv.baseUrl, {
++        headers: { 'content-type': 'application/json', 'content-length': '200' },
++        hold: '{"a":',
++      });
++      assertError(res, 401, 'UNAUTHORIZED');
++      assert.ok(Date.now() - startedAt < 900, 'must not wait for the body');
++    });
++  });
++
++  it('Rate limit before Body: once limited, bad bodies are answered 429, not 415 / 413 / 400', async () => {
++    const provider = countingProvider();
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider }, async (srv) => {
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++      for (const send of Object.values(BAD_BODIES)) {
++        assertError(await send({ baseUrl: srv.baseUrl, headers: bearer() }), 429, 'RATE_LIMITED');
++      }
++      const unfinished = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'content-length': '200' },
++        hold: '{"a":',
++      });
++      assertError(unfinished, 429, 'RATE_LIMITED');
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('Auth before Rate limit: a wrong token is still 401 (not 429) once the budget is used up', async () => {
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider: countingProvider() }, async (srv) => {
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 429);
++      assertError(await postJsonRaw(srv.baseUrl, VALID, bearer('wrong-token-value')), 401, 'UNAUTHORIZED');
++    });
++  });
++
++  it('Origin before Auth: a disallowed origin is 403 even with a valid token or no token', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      assertError(await postJsonRaw(srv.baseUrl, VALID, { ...bearer(), origin: EVIL }), 403, 'ORIGIN_NOT_ALLOWED');
++      assertError(await postJsonRaw(srv.baseUrl, VALID, { origin: EVIL }), 403, 'ORIGIN_NOT_ALLOWED');
++      assert.equal(provider.calls, 0);
++    });
++  });
++
++  it('Body checks apply after Auth + Rate limit when both pass (full pipeline reaches the handler)', async () => {
++    const provider = countingProvider();
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '10' }, { provider }, async (srv) => {
++      assertError(await BAD_BODIES['wrong Content-Type (415)']({ baseUrl: srv.baseUrl, headers: bearer() }), 415, 'UNSUPPORTED_MEDIA_TYPE');
++      assertError(await BAD_BODIES['oversized body (413)']({ baseUrl: srv.baseUrl, headers: bearer() }), 413, 'PAYLOAD_TOO_LARGE');
++      assertError(await BAD_BODIES['invalid JSON (400)']({ baseUrl: srv.baseUrl, headers: bearer() }), 400, 'INVALID_JSON');
++      assertError(await BAD_BODIES['empty body (400)']({ baseUrl: srv.baseUrl, headers: bearer() }), 400, 'INVALID_JSON');
++      assert.equal(provider.calls, 0);
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('regression - the translation provider is never called for a rejected request', () => {
++  it('403, 401, 404, 405, 415, 413, 408, 400, 204 and 429 leave the provider untouched', async () => {
++    const provider = countingProvider();
++    // Rejections that happen AFTER authentication (415 / 413 / 408 / 400) do use up
++    // rate-limit budget, so the limit is set well above the number of requests here.
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1000' }, { provider }, async (srv) => {
++      const url = srv.baseUrl;
++      const typed = (type) => post(url, { headers: { ...bearer(), 'content-type': type, 'content-length': '2' }, body: '{}' });
++
++      const rejected = [
++        [403, await postJsonRaw(url, VALID, { ...bearer(), origin: EVIL })],
++        [403, await postJsonRaw(url, VALID, { ...bearer(), origin: 'null' })],
++        [401, await postJsonRaw(url, VALID)],
++        [401, await postJsonRaw(url, VALID, bearer('wrong-token-value'))],
++        [404, await get(url, '/nope')],
++        [405, await rawRequest(url, { method: 'GET', path: '/v1/translate' })],
++        [415, await post(url, { headers: bearer(), body: JSON.stringify(VALID) })],
++        [415, await typed('text/plain')],
++        [415, await typed('application/json; charset=utf-16')],
++        [413, await postJsonRaw(url, 'x'.repeat(MAX + 1), bearer())],
++        [
++          413,
++          await post(url, {
++            headers: { ...bearer(), 'content-type': 'application/json', 'transfer-encoding': 'chunked' },
++            chunks: ['a'.repeat(700), 'b'.repeat(700)],
++          }),
++        ],
++        [
++          408,
++          await post(url, {
++            headers: { ...bearer(), 'content-type': 'application/json', 'content-length': '200' },
++            hold: '{"a":',
++          }),
++        ],
++        [400, await postJsonRaw(url, '{not json', bearer())],
++        [400, await postJsonRaw(url, '', bearer())],
++        [400, await postJsonRaw(url, {}, bearer())],
++        [204, await preflight(url, { origin: ALLOWED })],
++        [403, await preflight(url, { origin: ALLOWED, method: 'DELETE' })],
++        [403, await preflight(url, { origin: ALLOWED, requestHeaders: 'x-evil' })],
++      ];
++      for (const [expected, res] of rejected) {
++        assert.equal(res.status, expected, `expected ${expected}, got ${res.status}: ${res.text.slice(0, 120)}`);
++      }
++      assert.equal(provider.calls, 0, 'provider must not be called by any rejected request');
++
++      // Sanity check: the same server still serves a valid request afterwards.
++      assert.equal((await postJsonRaw(url, VALID, bearer())).status, 200);
++      assert.equal(provider.calls, 1);
++    });
++  });
++
++  it('with no provider injected, authorised valid requests are still 501 (no fake success)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assertError(await postJsonRaw(srv.baseUrl, VALID, bearer()), 501, 'NOT_IMPLEMENTED');
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('regression - GET /health keeps working', () => {
++  it('is public, returns the same body, and is not rate limited', async () => {
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, {}, async (srv) => {
++      let first;
++      for (let i = 0; i < 10; i += 1) {
++        const res = await get(srv.baseUrl, '/health');
++        assert.equal(res.status, 200);
++        assert.equal(res.headers['ratelimit-limit'], undefined);
++        assertSecurityHeaders(res, 'health');
++        first ??= res.json();
++        assert.deepEqual(res.json(), first);
++      }
++      assert.equal(first.status, 'ok');
++      assert.equal(typeof first.service, 'string');
++      assert.equal(typeof first.version, 'string');
++    });
++  });
++
++  it('works for native clients, allowed browser origins, and with an empty allowlist (native)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      assert.equal((await get(srv.baseUrl, '/health')).status, 200);
++      const browser = await get(srv.baseUrl, '/health', { origin: ALLOWED });
++      assert.equal(browser.status, 200);
++      assert.equal(browser.headers['access-control-allow-origin'], ALLOWED);
++    });
++    await withServer({}, {}, async (srv) => {
++      assert.equal((await get(srv.baseUrl, '/health')).status, 200);
++    });
++  });
++
++  it('does not leak the token, and non-GET methods are still refused', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await get(srv.baseUrl, '/health');
++      assert.ok(!res.text.includes(TOKEN));
++      const wrongMethod = await rawRequest(srv.baseUrl, { method: 'POST', path: '/health', headers: { 'content-length': '0' } });
++      assertError(wrongMethod, 405, 'METHOD_NOT_ALLOWED');
++    });
++  });
++});
++
++/* ------------------------------------------------------------------ */
++describe('regression - secrets never reach responses or logs', () => {
++  it('the client token appears in no response body, response header or log line across all the rejection paths', async () => {
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider: countingProvider() }, async (srv) => {
++      const url = srv.baseUrl;
++      const responses = [
++        await postJsonRaw(url, VALID, bearer()),
++        await postJsonRaw(url, VALID, bearer()), // 429
++        await postJsonRaw(url, VALID, { ...bearer(), origin: EVIL }), // 403
++        await postJsonRaw(url, VALID), // 401
++        await postJsonRaw(url, '{bad', { ...bearer(), origin: ALLOWED }),
++        await preflight(url, { origin: ALLOWED }),
++        await get(url, '/health'),
++      ];
++      const everything = [
++        ...responses.map((r) => r.text + r.rawHeaders.join('\n')),
++        srv.logs.join('\n'),
++      ].join('\n');
++      assert.ok(!everything.includes(TOKEN), 'client token leaked');
++    });
++  });
++});
+diff --git a/test/httpTestKit.js b/test/httpTestKit.js
+new file mode 100644
+index 0000000..7efcbfe
+--- /dev/null
++++ b/test/httpTestKit.js
+@@ -0,0 +1,222 @@
++import assert from 'node:assert/strict';
++import http from 'node:http';
++import { startTestServer } from './helpers.js';
++
++/**
++ * Phase 05-B2.3-T: shared helpers for the HTTP security tests.
++ * Test-only file. It is not named *.test.js, so `node --test test/*.test.js`
++ * does not run it directly.
++ *
++ * Why node:http instead of fetch()? The tests need full control over headers
++ * that fetch() manages or forbids (Origin, Content-Type, Content-Length,
++ * Transfer-Encoding) and over partially-sent bodies.
++ */
++
++export const TOKEN = 'b23t-http-security-test-token';
++export const VALID = Object.freeze({ sourceLanguage: 'ja', targetLanguage: 'my', text: 'こんにちは' });
++export const bearer = (token = TOKEN) => ({ authorization: `Bearer ${token}` });
++export const UUID = /^[0-9a-f-]{36}$/;
++
++/** Provider test double that counts calls (same shape as auth/rateLimit tests). */
++export function countingProvider() {
++  const p = {
++    id: 'counting-double',
++    calls: 0,
++    async translate(r) {
++      p.calls += 1;
++      return { ...r, translatedText: 'ok', provider: 'counting-double' };
++    },
++  };
++  return p;
++}
++
++/** Provider that throws a plain Error (exercises the 500 path). */
++export function throwingProvider() {
++  return {
++    id: 'throwing-double',
++    async translate() {
++      throw new Error('boom (test double)');
++    },
++  };
++}
++
++/**
++ * Send one raw HTTP request on its own keep-alive connection.
++ *
++ * Body options (use at most one):
++ *   body   - string | Buffer, sent with req.end(body)
++ *   chunks - string[], written one by one; without a Content-Length header
++ *            Node uses Transfer-Encoding: chunked
++ *   hold   - string, written but the request is NEVER finished (incomplete body)
++ *
++ * Resolves as soon as the response has been fully read. Socket errors that
++ * happen after the response arrived (the server closes the connection after
++ * 413 / 408) are ignored.
++ *
++ * @returns {Promise<{ status: number, headers: Record<string,string|string[]|undefined>,
++ *                     rawHeaders: string[], text: string, json: () => any }>}
++ */
++export function rawRequest(baseUrl, { method = 'GET', path = '/', headers = {}, body, chunks, hold, timeoutMs = 8000 } = {}) {
++  const url = new URL(baseUrl);
++  // Keep-alive agent: the client then sends `Connection: keep-alive`, so a
++  // `Connection: close` in the response really comes from the server.
++  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
++  return new Promise((resolve, reject) => {
++    let settled = false;
++    let req;
++    const done = (fn, value) => {
++      if (settled) return;
++      settled = true;
++      clearTimeout(guard);
++      fn(value);
++      // Give the response a moment to flush, then drop the socket.
++      setImmediate(() => {
++        req?.destroy();
++        agent.destroy();
++      });
++    };
++    const guard = setTimeout(() => done(reject, new Error(`rawRequest timed out after ${timeoutMs} ms`)), timeoutMs);
++
++    req = http.request({ host: url.hostname, port: url.port, method, path, headers, agent }, (res) => {
++      const parts = [];
++      const finish = () => {
++        const text = Buffer.concat(parts).toString('utf8');
++        done(resolve, {
++          status: res.statusCode,
++          headers: res.headers,
++          rawHeaders: res.rawHeaders,
++          text,
++          json: () => JSON.parse(text),
++        });
++      };
++      res.on('data', (c) => parts.push(c));
++      res.on('end', finish);
++      res.on('close', finish);
++      res.on('error', finish);
++    });
++    req.on('error', (err) => done(reject, err));
++
++    if (hold !== undefined) {
++      req.write(hold);
++    } else if (chunks !== undefined) {
++      for (const c of chunks) req.write(c);
++      req.end();
++    } else if (body !== undefined) {
++      req.end(body);
++    } else {
++      req.end();
++    }
++  });
++}
++
++/** POST /v1/translate with explicit control over every header. */
++export function post(baseUrl, { headers = {}, ...rest } = {}) {
++  return rawRequest(baseUrl, { method: 'POST', path: '/v1/translate', headers, ...rest });
++}
++
++/** POST a JSON object with a correct Content-Type (extra headers merged in). */
++export function postJsonRaw(baseUrl, payload, headers = {}) {
++  const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
++  return post(baseUrl, {
++    headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers },
++    body,
++  });
++}
++
++export function get(baseUrl, path = '/health', headers = {}) {
++  return rawRequest(baseUrl, { method: 'GET', path, headers });
++}
++
++/** CORS preflight. `origin: null` omits the header; `requestHeaders: null` omits ACRH. */
++export function preflight(
++  baseUrl,
++  { path = '/v1/translate', origin, method = 'POST', requestHeaders = 'authorization, content-type', extra = {} } = {},
++) {
++  const headers = { ...extra };
++  if (origin !== null && origin !== undefined) headers.origin = origin;
++  if (method !== null) headers['access-control-request-method'] = method;
++  if (requestHeaders !== null) headers['access-control-request-headers'] = requestHeaders;
++  return rawRequest(baseUrl, { method: 'OPTIONS', path, headers });
++}
++
++/** Run `fn` against a real server and always close it. */
++export async function withServer(env, appOverrides, fn) {
++  const srv = await startTestServer(env, appOverrides);
++  try {
++    return await fn(srv);
++  } finally {
++    await srv.close();
++  }
++}
++
++/** Lower-cased tokens of the Vary header. */
++export function varyTokens(res) {
++  return String(res.headers.vary ?? '')
++    .split(',')
++    .map((t) => t.trim().toLowerCase())
++    .filter(Boolean);
++}
++
++/** Number of times a header name appears in the raw response header list. */
++export function headerCount(res, name) {
++  let n = 0;
++  for (let i = 0; i < res.rawHeaders.length; i += 2) {
++    if (res.rawHeaders[i].toLowerCase() === name) n += 1;
++  }
++  return n;
++}
++
++export const SECURITY_HEADER_NAMES = Object.freeze([
++  'x-content-type-options',
++  'referrer-policy',
++  'x-frame-options',
++  'content-security-policy',
++  'permissions-policy',
++]);
++
++/**
++ * The five B2.3 security headers must be present, correct and sent exactly once.
++ * Values are written out literally on purpose (not imported from src/), so a
++ * silent change in the source is caught.
++ */
++export function assertSecurityHeaders(res, label = '') {
++  const at = label ? ` [${label}]` : '';
++  const h = res.headers;
++  assert.equal(h['x-content-type-options'], 'nosniff', `X-Content-Type-Options${at}`);
++  assert.equal(h['referrer-policy'], 'no-referrer', `Referrer-Policy${at}`);
++  assert.equal(h['x-frame-options'], 'DENY', `X-Frame-Options${at}`);
++  assert.equal(h['content-security-policy'], "default-src 'none'; frame-ancestors 'none'", `Content-Security-Policy${at}`);
++  const pp = h['permissions-policy'];
++  assert.equal(typeof pp, 'string', `Permissions-Policy present${at}`);
++  for (const feature of ['camera=()', 'microphone=()', 'geolocation=()', 'payment=()']) {
++    assert.ok(pp.includes(feature), `Permissions-Policy contains ${feature}${at}`);
++  }
++  for (const name of SECURITY_HEADER_NAMES) {
++    assert.equal(headerCount(res, name), 1, `${name} sent exactly once${at}`);
++  }
++}
++
++/** No CORS grant of any kind on the response. */
++export function assertNoCorsGrant(res, label = '') {
++  const at = label ? ` [${label}]` : '';
++  for (const name of [
++    'access-control-allow-origin',
++    'access-control-allow-credentials',
++    'access-control-allow-methods',
++    'access-control-allow-headers',
++    'access-control-expose-headers',
++    'access-control-max-age',
++  ]) {
++    assert.equal(res.headers[name], undefined, `${name} must be absent${at}`);
++  }
++}
++
++/** Assert an error response: status, machine code, request id, JSON content type. */
++export function assertError(res, status, code) {
++  assert.equal(res.status, status, `status (body: ${res.text.slice(0, 200)})`);
++  assert.match(String(res.headers['content-type']), /^application\/json/);
++  const body = res.json();
++  assert.equal(body.error.code, code);
++  assert.match(body.error.requestId, UUID);
++  return body;
++}
+diff --git a/test/securityHeaders.test.js b/test/securityHeaders.test.js
+new file mode 100644
+index 0000000..c68c7de
+--- /dev/null
++++ b/test/securityHeaders.test.js
+@@ -0,0 +1,252 @@
++import assert from 'node:assert/strict';
++import { describe, it } from 'node:test';
++import {
++  TOKEN,
++  VALID,
++  assertError,
++  assertSecurityHeaders,
++  bearer,
++  countingProvider,
++  get,
++  postJsonRaw,
++  post,
++  preflight,
++  rawRequest,
++  throwingProvider,
++  withServer,
++} from './httpTestKit.js';
++
++const ALLOWED = 'https://app.example.com';
++const EVIL = 'https://evil.example.org';
++
++const ENV = {
++  GATEWAY_CLIENT_TOKEN: TOKEN,
++  GATEWAY_RATE_LIMIT_MAX: '1000',
++  GATEWAY_CORS_ALLOWED_ORIGINS: ALLOWED,
++  MAX_BODY_BYTES: '1024',
++};
++
++/**
++ * Security headers under test (Phase 05-B2.3):
++ *   X-Content-Type-Options, Referrer-Policy, X-Frame-Options,
++ *   Content-Security-Policy, Permissions-Policy
++ * assertSecurityHeaders() checks value and "exactly once" for all five.
++ */
++
++describe('security headers - success responses (2xx)', () => {
++  it('GET /health -> 200', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await get(srv.baseUrl, '/health');
++      assert.equal(res.status, 200);
++      assertSecurityHeaders(res, 'GET /health');
++    });
++  });
++
++  it('POST /v1/translate -> 200', async () => {
++    const provider = countingProvider();
++    await withServer(ENV, { provider }, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assert.equal(res.status, 200);
++      assertSecurityHeaders(res, 'POST /v1/translate');
++    });
++  });
++
++  it('a success response for an allowed CORS origin', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await get(srv.baseUrl, '/health', { origin: ALLOWED });
++      assert.equal(res.status, 200);
++      assertSecurityHeaders(res, 'allowed origin');
++    });
++  });
++});
++
++describe('security headers - error responses', () => {
++  it('400 INVALID_REQUEST / INVALID_JSON', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const invalid = await postJsonRaw(srv.baseUrl, {}, bearer());
++      assertError(invalid, 400, 'INVALID_REQUEST');
++      assertSecurityHeaders(invalid, '400 validation');
++
++      const notJson = await postJsonRaw(srv.baseUrl, '{not json', bearer());
++      assertError(notJson, 400, 'INVALID_JSON');
++      assertSecurityHeaders(notJson, '400 invalid json');
++    });
++  });
++
++  it('401 UNAUTHORIZED', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const none = await postJsonRaw(srv.baseUrl, VALID);
++      assertError(none, 401, 'UNAUTHORIZED');
++      assertSecurityHeaders(none, '401 no token');
++      const wrong = await postJsonRaw(srv.baseUrl, VALID, bearer('wrong-token-value'));
++      assertError(wrong, 401, 'UNAUTHORIZED');
++      assertSecurityHeaders(wrong, '401 wrong token');
++    });
++  });
++
++  it('405 METHOD_NOT_ALLOWED', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await rawRequest(srv.baseUrl, { method: 'GET', path: '/v1/translate' });
++      assertError(res, 405, 'METHOD_NOT_ALLOWED');
++      assertSecurityHeaders(res, '405');
++    });
++  });
++
++  it('413 PAYLOAD_TOO_LARGE', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, 'x'.repeat(2048), bearer());
++      assertError(res, 413, 'PAYLOAD_TOO_LARGE');
++      assertSecurityHeaders(res, '413');
++    });
++  });
++
++  it('415 UNSUPPORTED_MEDIA_TYPE', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await post(srv.baseUrl, { headers: { ...bearer(), 'content-type': 'text/plain' }, body: 'x' });
++      assertError(res, 415, 'UNSUPPORTED_MEDIA_TYPE');
++      assertSecurityHeaders(res, '415');
++    });
++  });
++
++  it('429 RATE_LIMITED', async () => {
++    await withServer({ ...ENV, GATEWAY_RATE_LIMIT_MAX: '1' }, { provider: countingProvider() }, async (srv) => {
++      assert.equal((await postJsonRaw(srv.baseUrl, VALID, bearer())).status, 200);
++      const res = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assertError(res, 429, 'RATE_LIMITED');
++      assertSecurityHeaders(res, '429');
++    });
++  });
++
++  it('501 NOT_IMPLEMENTED (no provider injected)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assertError(res, 501, 'NOT_IMPLEMENTED');
++      assertSecurityHeaders(res, '501');
++    });
++  });
++
++  it('500 INTERNAL_ERROR (provider throws)', async () => {
++    await withServer(ENV, { provider: throwingProvider() }, async (srv) => {
++      const res = await postJsonRaw(srv.baseUrl, VALID, bearer());
++      assertError(res, 500, 'INTERNAL_ERROR');
++      assertSecurityHeaders(res, '500');
++      assert.ok(!res.text.includes('boom'), 'internal error message must not leak');
++    });
++  });
++
++  it('408 REQUEST_TIMEOUT (incomplete body)', async () => {
++    await withServer({ ...ENV, REQUEST_TIMEOUT_MS: '1000' }, {}, async (srv) => {
++      const res = await post(srv.baseUrl, {
++        headers: { ...bearer(), 'content-type': 'application/json', 'content-length': '100' },
++        hold: '{"sourceLanguage":',
++      });
++      assertError(res, 408, 'REQUEST_TIMEOUT');
++      assertSecurityHeaders(res, '408');
++    });
++  });
++});
++
++describe('security headers - 404, 403 and 204', () => {
++  it('404 NOT_FOUND (native client and allowed origin)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const native = await get(srv.baseUrl, '/nope');
++      assertError(native, 404, 'NOT_FOUND');
++      assertSecurityHeaders(native, '404 native');
++      const browser = await get(srv.baseUrl, '/nope', { origin: ALLOWED });
++      assertError(browser, 404, 'NOT_FOUND');
++      assertSecurityHeaders(browser, '404 allowed origin');
++    });
++  });
++
++  it('403 ORIGIN_NOT_ALLOWED (unknown origin, null origin)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      for (const origin of [EVIL, 'null']) {
++        const res = await get(srv.baseUrl, '/health', { origin });
++        assertError(res, 403, 'ORIGIN_NOT_ALLOWED');
++        assertSecurityHeaders(res, `403 origin ${origin}`);
++      }
++    });
++  });
++
++  it('403 CORS_PREFLIGHT_REJECTED (bad method, bad headers)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const method = await preflight(srv.baseUrl, { origin: ALLOWED, method: 'DELETE' });
++      assertError(method, 403, 'CORS_PREFLIGHT_REJECTED');
++      assertSecurityHeaders(method, '403 preflight method');
++      const headers = await preflight(srv.baseUrl, { origin: ALLOWED, requestHeaders: 'x-evil' });
++      assertError(headers, 403, 'CORS_PREFLIGHT_REJECTED');
++      assertSecurityHeaders(headers, '403 preflight headers');
++    });
++  });
++
++  it('403 when the allowlist is empty', async () => {
++    await withServer({ GATEWAY_CLIENT_TOKEN: TOKEN }, {}, async (srv) => {
++      const res = await get(srv.baseUrl, '/health', { origin: ALLOWED });
++      assertError(res, 403, 'ORIGIN_NOT_ALLOWED');
++      assertSecurityHeaders(res, '403 empty allowlist');
++    });
++  });
++
++  it('204 preflight (both routes)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const translate = await preflight(srv.baseUrl, { origin: ALLOWED });
++      assert.equal(translate.status, 204);
++      assert.equal(translate.text, '');
++      assertSecurityHeaders(translate, '204 /v1/translate');
++
++      const health = await preflight(srv.baseUrl, { path: '/health', origin: ALLOWED, method: 'GET', requestHeaders: null });
++      assert.equal(health.status, 204);
++      assertSecurityHeaders(health, '204 /health');
++    });
++  });
++});
++
++describe('security headers - exact values', () => {
++  it('values are strict for a JSON-only API (nosniff, no-referrer, DENY, default-src none, features off)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const h = (await get(srv.baseUrl, '/health')).headers;
++      assert.equal(h['x-content-type-options'], 'nosniff');
++      assert.equal(h['referrer-policy'], 'no-referrer');
++      assert.equal(h['x-frame-options'], 'DENY');
++      assert.equal(h['content-security-policy'], "default-src 'none'; frame-ancestors 'none'");
++      for (const feature of [
++        'accelerometer=()',
++        'camera=()',
++        'geolocation=()',
++        'gyroscope=()',
++        'magnetometer=()',
++        'microphone=()',
++        'payment=()',
++        'usb=()',
++      ]) {
++        assert.ok(h['permissions-policy'].includes(feature), feature);
++      }
++    });
++  });
++
++  it('the CSP forbids framing and every default source (no unsafe-inline / wildcard)', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const csp = (await get(srv.baseUrl, '/health')).headers['content-security-policy'];
++      assert.ok(csp.includes("default-src 'none'"));
++      assert.ok(csp.includes("frame-ancestors 'none'"));
++      assert.ok(!csp.includes('unsafe'));
++      assert.ok(!csp.includes('*'));
++    });
++  });
++
++  it('headers are identical across a success and an error response', async () => {
++    await withServer(ENV, {}, async (srv) => {
++      const ok = await get(srv.baseUrl, '/health');
++      const err = await get(srv.baseUrl, '/nope');
++      for (const name of [
++        'x-content-type-options',
++        'referrer-policy',
++        'x-frame-options',
++        'content-security-policy',
++        'permissions-policy',
++      ]) {
++        assert.equal(ok.headers[name], err.headers[name], name);
++      }
++    });
++  });
++});
