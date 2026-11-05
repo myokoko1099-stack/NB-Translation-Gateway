@@ -51,9 +51,20 @@ function mockFetch(handler) {
   return fn;
 }
 
+// AbortSignal.timeout() uses an unref'd timer, so while this promise is pending nothing
+// else keeps the event loop alive and node:test would cancel the test. The (ref'd)
+// keep-alive timer below holds the loop open until the abort fires.
 const hangingFetch = (_url, init) =>
   new Promise((_resolve, reject) => {
-    init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    const keepAlive = setTimeout(() => {}, 30_000);
+    init.signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(keepAlive);
+        reject(init.signal.reason);
+      },
+      { once: true },
+    );
   });
 
 /** Build the Gemini provider exactly like src/index.js does (config -> createProvider). */
