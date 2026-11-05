@@ -1,8 +1,8 @@
-# MNB Translation Gateway (Phase 05-B2.3)
+# MNB Translation Gateway (Phase 05-B3)
 
 MNB Android Novel Browser အတွက် သီးခြား Backend Gateway ၏ **အခြေခံ (foundation) ဗားရှင်း `0.1.0`**။
 
-> **အခြေအနေ**: `GET /health` သည် public ဖြစ်ပြီး အလုပ်လုပ်သည်။ `POST /v1/translate` သည် **Bearer Token Authentication** (Phase 05-B2.1) ဖြင့် ကာကွယ်ထားသည်။ Authenticate ပြီးသော request များကို client IP အလိုက် **Rate Limiting** (Phase 05-B2.2) ဖြင့် ကန့်သတ်သည်။ Response အားလုံးတွင် **Security Headers** ပါပြီး Browser Origin များကို **CORS Allowlist** (Phase 05-B2.3) ဖြင့်သာ လက်ခံသည်။ Request body ကို Content-Type / Size / Timeout ဖြင့် ကာကွယ်ထားသည်။ ကန့်သတ်ချက်အတွင်း valid request အတွက် `501 NOT_IMPLEMENTED` ပြန်သည် (provider မချိတ်ရသေး)။ Gemini နှင့် မချိတ်ရသေး၊ Retry / Quota / Android integration မရှိသေး။
+> **အခြေအနေ**: `GET /health` သည် public ဖြစ်ပြီး အလုပ်လုပ်သည်။ `POST /v1/translate` သည် **Bearer Token Authentication** (Phase 05-B2.1) ဖြင့် ကာကွယ်ထားသည်။ Authenticate ပြီးသော request များကို client IP အလိုက် **Rate Limiting** (Phase 05-B2.2) ဖြင့် ကန့်သတ်သည်။ Response အားလုံးတွင် **Security Headers** ပါပြီး Browser Origin များကို **CORS Allowlist** (Phase 05-B2.3) ဖြင့်သာ လက်ခံသည်။ Request body ကို Content-Type / Size / Timeout ဖြင့် ကာကွယ်ထားသည်။ **Phase 05-B3**: `TRANSLATION_PROVIDER=gemini` ဖြစ်လျှင် valid request ကို Gemini Interactions API သို့ server-side မှ ပို့၍ ဘာသာပြန်ရလဒ်ပြန်သည်။ `TRANSLATION_PROVIDER=none` (default) ဖြစ်လျှင် ယခင်အတိုင်း `501 NOT_IMPLEMENTED` ပြန်သည်။ Upstream error များကို `errorResponse.js` ဖြင့် sanitise လုပ်၍ ပို့သည်။ Automatic Retry / Quota / Android integration မရှိသေး။
 
 Base: Phase 05-B2.2 merge commit `8e3d63382f9559ee2187abd6da48754bbe88001a`။ ဤ project သည် Android source နှင့် MNB translation pipeline ကို မထိခိုက်ပါ (သီးခြား directory)။
 
@@ -36,7 +36,8 @@ curl -X POST http://127.0.0.1:8080/v1/translate \
   -H 'authorization: Bearer <your-local-token>' \
   -H 'content-type: application/json' \
   -d '{"sourceLanguage":"ja","targetLanguage":"my","text":"こんにちは"}'
-# 501 {"error":{"code":"NOT_IMPLEMENTED", ...}}   (authenticated, provider မရှိသေး)
+# TRANSLATION_PROVIDER=none (default): 501 {"error":{"code":"NOT_IMPLEMENTED", ...}}
+# TRANSLATION_PROVIDER=gemini:         200 {"translatedText":"...","sourceLanguage":"ja","targetLanguage":"my","provider":"gemini"}
 ```
 
 ## Authentication (Phase 05-B2.1)
@@ -109,13 +110,59 @@ Response အားလုံး (အောင်မြင်/error/preflight) တ
 - Node ကိုယ်တိုင် parse မလုပ်နိုင်သော ကွန်ရက်အဆင့် error များ (ဥပမာ header ကြီးလွန်းခြင်း၊ ပုံစံမမှန်သော HTTP) ကို Node က တိုက်ရိုက်ဖြေသဖြင့် ထို response များတွင် Security Headers မပါနိုင်ပါ။
 - Allowlist ၏ `http://` Origin များကို ခွင့်ပြုသည် (local development အတွက်)။ Production တွင် `https://` သာ ထည့်ပါ။
 
+## Translation Provider (Phase 05-B3)
+
+### ဖွင့်ပုံ
+
+```bash
+# Gemini API Key ကို shell / hosting dashboard / git-ignored .env တွင်သာ သတ်မှတ်ပါ (ဤဖိုင်တွင် တန်ဖိုး မရေးပါ)
+TRANSLATION_PROVIDER=gemini npm run dev
+```
+
+| Variable | အဓိပ္ပာယ် |
+|---|---|
+| `TRANSLATION_PROVIDER` | `none` (default) / `gemini`။ `none` ဖြစ်လျှင် `GEMINI_*` variable များကို လုံးဝ မဖတ်/မစစ်ပါ၊ `501 NOT_IMPLEMENTED` ပြန်သည် |
+| `GEMINI_API_KEY` | `gemini` ဖြစ်လျှင် **မဖြစ်မနေ**။ `Secret` wrapper ဖြင့်သာ သိမ်းသည်။ `src/config/translationProvider.js` တစ်ခုတည်းသာ ဖတ်ခွင့်ရှိသည် |
+| `GEMINI_MODEL` | default `gemini-3.1-flash-lite` (letters / digits / `.` `_` `-`၊ အများဆုံး 64) |
+| `GEMINI_TIMEOUT_MS` | default `30000` (1000–120000) |
+
+တန်ဖိုးမမှန်လျှင် startup မစတင်ဘဲ variable နာမည်ပါသော error ဖြင့် `exit 1` (တန်ဖိုးကို မပြပါ)။
+
+### Gemini Request
+
+- `POST https://generativelanguage.googleapis.com/v1beta/interactions` — endpoint ကို code ထဲတွင် ပုံသေထားသည်၊ environment / request field ဖြင့် မပြောင်းနိုင်ပါ။
+- Header `x-goog-api-key`၊ body `{ model, input, system_instruction, store: false }`။
+- Response ၏ `status` သည် `completed` ဖြစ်ရမည်၊ `steps[]` ထဲမှ `model_output` → `content[]` → `text` ကိုသာ ယူသည်။ `incomplete` / `failed` / ဗလာ ရလဒ်များသည် error။
+- Node native `fetch`၊ `redirect: 'error'`၊ `AbortSignal.timeout`၊ **Automatic Retry မရှိ**၊ npm dependency အသစ် မရှိ။
+- Request schema မပြောင်းပါ (`sourceLanguage`, `targetLanguage`, `text`)။ ဘာသာပြန်ရန် စာသားကို `input` အဖြစ်သာ ပို့ပြီး ညွှန်ကြားချက်များကို `system_instruction` တွင်သာ ထားသည် (စာသားထဲရှိ ညွှန်ကြားချက်များကို မလိုက်နာရန် ပါဝင်သည်)။
+
+### Error Mapping
+
+| Gemini | Client response |
+|---|---|
+| 400 / 401 / 403 / 404 | `502 UPSTREAM_ERROR` |
+| 429 | `429 UPSTREAM_RATE_LIMITED` (gateway ၏ `RATE_LIMITED` နှင့် code ကွဲသည်၊ upstream `Retry-After` မပို့ပါ) |
+| 500 | `502 UPSTREAM_ERROR` |
+| 503 | `503 UPSTREAM_UNAVAILABLE` |
+| Timeout | `504 UPSTREAM_TIMEOUT` |
+| Network failure / Invalid JSON / Empty / Incomplete response | `502 UPSTREAM_ERROR` |
+
+Raw Gemini error text၊ status line၊ URL၊ API Key တို့ကို client သို့ မပို့ပါ။ 5xx များသည် `errorResponse.js` ကြောင့် message ပုံသေ (`Upstream service error.` / `Service unavailable.` / `Upstream service timed out.`) သာ ပါသည်။
+
+### လုံခြုံရေး
+
+- API Key ကို server တွင်သာ သုံးသည်။ Android APK / Git / `.env.example` ထဲ မထည့်ပါ။
+- Log ထဲသို့ API Key၊ Request Text၊ Translated Text မထည့်ပါ။ Provider သည် failure တွင် reason category နှင့် status ကိုသာ log ထုတ်သည်။
+- `src/index.js` သည် Client Token နှင့် Gemini Key ၏ exact value များကို Logger သို့ ပေးထားသဖြင့် မှားယွင်း၍ ပါလာလျှင်လည်း `[REDACTED]` ဖြစ်သည်။
+- Authentication → Rate Limiting → Validation အစီအစဉ် မပြောင်းပါ၊ ထို့ကြောင့် မအောင်မြင်သော request များက Gemini ကို မခေါ်ပါ။
+
 ## Test
 
 ```bash
-npm test      # node:test, 104 tests (B1: 49 + B2.1: 22 + B2.2: 33)
+npm test      # node --test test/*.test.js
 ```
 
-> Phase 05-B2.3 အတွက် test အသစ် မထည့်ရသေး (ဤ Phase တွင် Local Test မလုပ်ရန် ညွှန်ကြားထားသောကြောင့်)။ `B2.3-REPORT.md` ကို ကြည့်ပါ။
+Phase 05-B3 တွင် Gemini test ဖိုင် ၃ ခု ထည့်ထားသည် (`geminiConfig.test.js`, `geminiProvider.test.js`, `geminiGateway.test.js`)။ Mock fetch သာ သုံးသည် — Real Gemini API / Real API Key မသုံးပါ။ ဤ Phase တွင် Local Test မ run ထားပါ၊ GitHub Actions ၏ ရလဒ်သာ အတည်ပြုချက်ဖြစ်သည်။ `B3-REPORT.md` ကို ကြည့်ပါ။
 
 ## Configuration
 
@@ -125,7 +172,9 @@ Variable စာရင်းနှင့် default များကို `.env.e
 - `NODE_ENV=production` တွင် `GATEWAY_CLIENT_TOKEN` မရှိလျှင် server မစတင်ဘဲ `exit 1`။
 - Rate limit: `GATEWAY_RATE_LIMIT_MAX`, `GATEWAY_RATE_LIMIT_WINDOW_MS`, `GATEWAY_TRUSTED_PROXY_HOPS` (အထက်ပါ Rate Limiting အပိုင်း ကြည့်ပါ)။
 - CORS: `GATEWAY_CORS_ALLOWED_ORIGINS` (ဗလာ = Browser Origin အားလုံး ပယ်ချ၊ Native client မထိခိုက်)။
-- Secret များကို Git ထဲ မထည့်ပါနှင့်။ `.env` ကို `.gitignore` လုပ်ထားသည်။ နောက် Phase ၏ `GEMINI_API_KEY` နှင့် `GATEWAY_CLIENT_TOKEN` ကို hosting dashboard တွင်သာ သတ်မှတ်ပါ။
+- Provider: `TRANSLATION_PROVIDER` (`none` default / `gemini`)၊ `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_TIMEOUT_MS` (အထက်ပါ Translation Provider အပိုင်း ကြည့်ပါ)။
+- Secret များကို Git ထဲ မထည့်ပါနှင့်။ `.env` ကို `.gitignore` လုပ်ထားသည်။ `GEMINI_API_KEY` နှင့် `GATEWAY_CLIENT_TOKEN` ကို hosting dashboard တွင်သာ သတ်မှတ်ပါ။
+- `src/config/productionGuard.js` ကို `src/index.js` မှ **မခေါ်ရသေး** (B3 တွင်လည်း မချိတ်ပါ) — production တွင် placeholder token / `LOG_LEVEL=debug` ကို guard က မတားသေးပါ။ `SECURITY-NOTES.md` ကို ကြည့်ပါ။
 
 ## စာရွက်စာတမ်းများ
 
@@ -133,7 +182,7 @@ Variable စာရင်းနှင့် default များကို `.env.e
 |---|---|
 | `ARCHITECTURE.md` | အလွှာများ၊ API contract၊ configuration (B1 အချိန်က — B2.1 မပါသေး) |
 | `HOSTING-DECISION.md` | Free-tier hosting ရွေးချယ်မှု၊ Verified / UNVERIFIED |
-| `SECURITY-NOTES.md` | Secret handling၊ လုံခြုံရေး ကွာဟချက်များ (B1 အချိန်က) |
+| `SECURITY-NOTES.md` | Secret handling၊ Error handling၊ Gemini provider လုံခြုံရေး၊ ကွာဟချက်များ (B3 အထိ) |
 | `TEST-REPORT.md` | B1 QA report |
 | `CHANGED_FILES.md` | B1 ဖိုင်စာရင်း |
 | `B2.1-REPORT.md` | Phase 05-B2.1 report |
@@ -142,7 +191,9 @@ Variable စာရင်းနှင့် default များကို `.env.e
 | `CHANGED_FILES-B2.2.md` | Phase 05-B2.2 ပြောင်းလဲသော ဖိုင်စာရင်း |
 | `B2.3-REPORT.md` | Phase 05-B2.3 report |
 | `CHANGED_FILES-B2.3.md` | Phase 05-B2.3 ပြောင်းလဲသော ဖိုင်စာရင်း |
+| `B3-REPORT.md` | Phase 05-B3 report (Gemini Provider Integration) |
+| `CHANGED_FILES-B3.md` | Phase 05-B3 ပြောင်းလဲသော ဖိုင်စာရင်း |
 
 ## Scope
 
-ဤ Phase (B2.3) တွင် မပါဝင်သည်: Gemini Adapter၊ Distributed (multi-instance) Rate Limiting၊ Retry System၊ Quota Management၊ Android Integration၊ Deployment။ နောက် Phase (B2.4) ကို စတင်ရန် သီးခြား ညွှန်ကြားချက် လိုအပ်သည်။
+ဤ Phase (B3) တွင် ပါဝင်သည်: Gemini Interactions API provider၊ `errorResponse.js` ကို server နှင့် ချိတ်ခြင်း၊ Logger သို့ Secret value များ ပေးခြင်း။ မပါဝင်သည်: Automatic Retry၊ Quota Management၊ Distributed Rate Limiting၊ `productionGuard.js` ချိတ်ဆက်ခြင်း၊ Android Integration၊ Deployment။ နောက် Phase အတွက် သီးခြား ညွှန်ကြားချက် လိုအပ်သည်။
