@@ -2,6 +2,12 @@ import { ConfigError } from '../domain/errors.js';
 import { SERVICE_NAME, VERSION } from '../meta.js';
 import { LOG_LEVELS, PROFILES } from './profiles.js';
 
+/** Name of the environment variable holding the CORS origin allowlist (Phase 05-B2.3). */
+export const CORS_ORIGINS_VAR = 'GATEWAY_CORS_ALLOWED_ORIGINS';
+
+const MAX_CORS_ORIGINS = 50;
+const MAX_CORS_ORIGIN_LENGTH = 255;
+
 /**
  * Parse an optional integer variable. Pushes a problem (variable NAME and
  * reason only - never the raw value) when it is present but invalid.
@@ -24,6 +30,56 @@ function intVar(env, name, fallback, { min, max }, problems) {
     return fallback;
   }
   return n;
+}
+
+/**
+ * A valid allowlist entry is a bare, canonical http(s) origin exactly as a
+ * browser serialises it: scheme://host[:port], lowercase, no path, no query,
+ * no trailing slash, no userinfo, no default port, no wildcard.
+ */
+function isCanonicalOrigin(entry) {
+  if (entry.length > MAX_CORS_ORIGIN_LENGTH || entry.includes('*')) return false;
+  let url;
+  try {
+    url = new URL(entry);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+  return url.origin === entry;
+}
+
+/**
+ * Parse GATEWAY_CORS_ALLOWED_ORIGINS (comma-separated origins).
+ * Unset / blank -> empty list (no browser origin is allowed; native clients
+ * without an Origin header are unaffected). Problems name the variable and the
+ * entry position only, never the entry value.
+ */
+function originList(env, problems) {
+  const raw = env[CORS_ORIGINS_VAR];
+  if (raw === undefined || raw.trim() === '') return Object.freeze([]);
+
+  const entries = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+  if (entries.length > MAX_CORS_ORIGINS) {
+    problems.push(`${CORS_ORIGINS_VAR} must list at most ${MAX_CORS_ORIGINS} origins`);
+    return Object.freeze([]);
+  }
+
+  const origins = new Set();
+  entries.forEach((entry, index) => {
+    if (isCanonicalOrigin(entry)) {
+      origins.add(entry);
+    } else {
+      problems.push(
+        `${CORS_ORIGINS_VAR} entry ${index + 1} must be an exact origin such as https://example.com[:port] ` +
+          '(http/https only; no wildcard, path, trailing slash or "null")',
+      );
+    }
+  });
+  return Object.freeze([...origins]);
 }
 
 /**
@@ -60,6 +116,8 @@ export function loadConfig(env) {
   );
   const trustedProxyHops = intVar(env, 'GATEWAY_TRUSTED_PROXY_HOPS', profile.trustedProxyHops, { min: 0, max: 10 }, problems);
 
+  const corsAllowedOrigins = originList(env, problems);
+
   const host = env.HOST === undefined || env.HOST === '' ? profile.host : env.HOST;
   if (!/^[A-Za-z0-9.:_-]+$/.test(host)) {
     problems.push('HOST contains invalid characters');
@@ -82,5 +140,6 @@ export function loadConfig(env) {
     server: Object.freeze({ host, port, requestTimeoutMs, maxBodyBytes }),
     limits: Object.freeze({ maxTextChars }),
     rateLimit: Object.freeze({ max: rateLimitMax, windowMs: rateLimitWindowMs, trustedProxyHops }),
+    cors: Object.freeze({ allowedOrigins: corsAllowedOrigins }),
   });
 }

@@ -47,6 +47,7 @@ server.listen(config.server.port, config.server.host, () => {
     rateLimitMax: config.rateLimit.max,
     rateLimitWindowMs: config.rateLimit.windowMs,
     trustedProxyHops: config.rateLimit.trustedProxyHops,
+    corsAllowedOrigins: config.cors.allowedOrigins.length,
   });
 });
 
